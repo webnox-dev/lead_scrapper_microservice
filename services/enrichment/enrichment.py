@@ -1,0 +1,605 @@
+"""Enrichment service - Website contact extraction.
+
+Simplified v2 — no Redis, no cache, no WebSocket.
+Scrapes websites directly to extract emails, phones, social links.
+"""
+
+import asyncio
+import re
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core.browser_manager import get_browser_manager
+from core.config import settings
+from core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+# Contact extraction patterns
+EMAIL_PATTERN = re.compile(
+    r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b",
+    re.IGNORECASE
+)
+
+PHONE_PATTERN = re.compile(
+    r"(?:\+91[-\s]?)?(?:\d{2,5}[-\s]?\d{5,8})|(?:\+91[-\s]?)?\d{10}",
+    re.IGNORECASE
+)
+
+SOCIAL_PATTERNS = {
+    "linkedin": re.compile(r"linkedin\.com/(?:company|in)/[^\s\"<>]+", re.I),
+    "facebook": re.compile(r"facebook\.com/[^\s\"<>]+", re.I),
+    "instagram": re.compile(r"instagram\.com/[^\s\"<>]+", re.I),
+    "twitter": re.compile(r"twitter\.com/[^\s\"<>]+|x\.com/[^\s\"<>]+", re.I),
+    "youtube": re.compile(r"youtube\.com/(?:channel|c|user)/[^\s\"<>]+|youtu\.be/[^\s\"<>]+", re.I),
+}
+
+HIGH_VALUE_PAGES = [
+    "contact", "contact-us", "contactus", "about", "about-us", "aboutus",
+    "team", "our-team", "careers", "jobs", "support",
+    "locations", "branches", "offices", "get-in-touch", "reach-us"
+]
+
+
+def clean_phone(phone: str) -> str:
+    """Clean and standardize phone number."""
+    digits = re.sub(r"\D", "", phone)
+    if digits.startswith("91") and len(digits) > 10:
+        digits = digits[2:]
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+class EnrichmentService:
+    """Website enrichment service."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+        self.browser = get_browser_manager()
+
+    async def enrich_website(
+        self,
+        website: str,
+        name_hint: str = "",
+    ) -> dict[str, Any] | None:
+        """Enrich a single website — extract contacts.
+
+        Args:
+            website: The website URL to scrape.
+            name_hint: Business name hint for fallback.
+
+        Returns:
+            Dict with emails, phones, social_links, etc. or None if failed.
+        """
+        logger.info("enrichment_started", website=website)
+
+        # Check database cache first
+        if self.db and website:
+            try:
+                from sqlalchemy import select
+                from db.models.lead import Lead
+                from urllib.parse import urlparse
+
+                # Normalize to look up both www and non-www variants
+                parsed = urlparse(website)
+                netloc = parsed.netloc
+                alt_netloc = netloc[4:] if netloc.startswith("www.") else f"www.{netloc}"
+                alt_website = website.replace(netloc, alt_netloc)
+
+                stmt = select(Lead).where(
+                    Lead.website.in_([website, alt_website])
+                ).order_by(Lead.created_at.desc()).limit(1)
+                
+                query_res = await self.db.execute(stmt)
+                existing_lead = query_res.scalar_one_or_none()
+                
+                if existing_lead and (
+                    existing_lead.emails or 
+                    existing_lead.phones or 
+                    existing_lead.whatsapp_numbers or 
+                    existing_lead.social_links
+                ):
+                    logger.info("enrichment_cache_hit", website=website, lead_id=str(existing_lead.id))
+                    print(f"⚡ Cache Hit: {website} (Reusing contacts)")
+                    return {
+                        "company": existing_lead.company_name or name_hint,
+                        "emails": existing_lead.emails,
+                        "phones": existing_lead.phones,
+                        "whatsapp_numbers": existing_lead.whatsapp_numbers,
+                        "addresses": [existing_lead.address] if existing_lead.address else [],
+                        "social_links": existing_lead.social_links,
+                        "contact_pages": existing_lead.enrichment_data.get("contact_pages", []) if existing_lead.enrichment_data else [],
+                        "pages_crawled": existing_lead.pages_crawled,
+                    }
+            except Exception as e:
+                logger.warning("enrichment_cache_lookup_failed", website=website, error=str(e))
+
+        print(f"🌐 Scraping: {website}")
+        result = await self._scrape_website(website, name_hint)
+
+        if result:
+            emails = result.get("emails", [])
+            phones = result.get("phones", [])
+            print(f"✅ {name_hint or website}: {len(emails)} emails, {len(phones)} phones")
+        else:
+            print(f"❌ {name_hint or website}: no contacts found")
+
+        return result
+
+    async def _scrape_website_httpx(
+        self,
+        website: str,
+        name_hint: str,
+    ) -> dict[str, Any] | None:
+        """Attempt to scrape the website using fast HTTP requests first."""
+        logger.info("httpx_enrichment_attempt", website=website)
+        company = ""
+        emails: set[str] = set()
+        phones: set[str] = set()
+        whatsapp_numbers: set[str] = set()
+        addresses: list[str] = []
+        social_links: set[str] = set()
+        contact_pages: list[str] = []
+        pages_crawled = 0
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+
+        import httpx
+        timeout = httpx.Timeout(15.0, connect=10.0)
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=timeout) as client:
+            try:
+                resp = await client.get(website)
+                if resp.status_code != 200:
+                    logger.info("httpx_homepage_non_200", website=website, status=resp.status_code)
+                    return None
+
+                html = resp.text
+                
+                title_match = re.search(r"<title>(.*?)</title>", html, re.I)
+                if title_match:
+                    company = title_match.group(1).split("|")[0].split("-")[0].strip()
+                else:
+                    company = name_hint
+
+                text = re.sub(r'<[^>]+>', ' ', html)
+                contacts = self._extract_contacts(text, html)
+                
+                emails.update(contacts["emails"])
+                phones.update(contacts["phones"])
+                whatsapp_numbers.update(contacts["whatsapp"])
+                addresses.extend(contacts["addresses"])
+                social_links.update(contacts["social_links"])
+                pages_crawled = 1
+
+                links = self._find_contact_links(html, website)
+                max_pages = settings.max_pages_per_site
+
+                visited = {website}
+                for url in links[:max_pages - 1]:
+                    if url in visited or pages_crawled >= max_pages:
+                        continue
+
+                    if len(emails) >= 3 and len(phones) >= 3:
+                        break
+
+                    try:
+                        p_resp = await client.get(url)
+                        if p_resp.status_code == 200:
+                            p_html = p_resp.text
+                            p_text = re.sub(r'<[^>]+>', ' ', p_html)
+                            p_contacts = self._extract_contacts(p_text, p_html)
+
+                            if p_contacts["emails"] or p_contacts["phones"]:
+                                contact_pages.append(url)
+                                emails.update(p_contacts["emails"])
+                                phones.update(p_contacts["phones"])
+                                whatsapp_numbers.update(p_contacts["whatsapp"])
+                                addresses.extend(p_contacts["addresses"])
+                                social_links.update(p_contacts["social_links"])
+
+                            visited.add(url)
+                            pages_crawled += 1
+                    except Exception as e:
+                        logger.debug("httpx_page_crawl_failed", url=url, error=str(e))
+                        continue
+
+            except Exception as e:
+                logger.info("httpx_homepage_failed", website=website, error=str(e))
+                raise
+
+        if not emails and not phones and not whatsapp_numbers:
+            logger.info("httpx_no_contacts_found", website=website)
+            return None
+
+        return {
+            "company": company or name_hint,
+            "emails": list(emails),
+            "phones": list(phones),
+            "whatsapp_numbers": list(whatsapp_numbers),
+            "addresses": list(set(addresses))[:5],
+            "social_links": list(social_links),
+            "contact_pages": contact_pages,
+            "pages_crawled": pages_crawled,
+        }
+
+    async def _scrape_website_httpx(
+        self,
+        website: str,
+        name_hint: str,
+    ) -> dict[str, Any] | None:
+        """Attempt to scrape the website using fast HTTP requests first."""
+        logger.info("httpx_enrichment_attempt", website=website)
+        company = ""
+        emails: set[str] = set()
+        phones: set[str] = set()
+        whatsapp_numbers: set[str] = set()
+        addresses: list[str] = []
+        social_links: set[str] = set()
+        contact_pages: list[str] = []
+        pages_crawled = 0
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+
+        import httpx
+        timeout = httpx.Timeout(15.0, connect=10.0)
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=timeout) as client:
+            try:
+                resp = await client.get(website)
+                if resp.status_code != 200:
+                    logger.info("httpx_homepage_non_200", website=website, status=resp.status_code)
+                    return None
+
+                # Verify Content-Type is HTML
+                content_type = resp.headers.get("Content-Type", "").lower()
+                if "text/html" not in content_type:
+                    logger.info("httpx_homepage_not_html", website=website, content_type=content_type)
+                    return None
+
+                html = resp.text
+                
+                title_match = re.search(r"<title>(.*?)</title>", html, re.I)
+                if title_match:
+                    company = title_match.group(1).split("|")[0].split("-")[0].strip()
+                else:
+                    company = name_hint
+
+                text = re.sub(r'<[^>]+>', ' ', html)
+                contacts = self._extract_contacts(text, html)
+                
+                emails.update(contacts["emails"])
+                phones.update(contacts["phones"])
+                whatsapp_numbers.update(contacts["whatsapp"])
+                addresses.extend(contacts["addresses"])
+                social_links.update(contacts["social_links"])
+                pages_crawled = 1
+
+                links = self._find_contact_links(html, website)
+                max_pages = settings.max_pages_per_site
+
+                visited = {website}
+                for url in links[:max_pages - 1]:
+                    if url in visited or pages_crawled >= max_pages:
+                        continue
+
+                    if len(emails) >= 3 and len(phones) >= 3:
+                        break
+
+                    try:
+                        p_resp = await client.get(url)
+                        if p_resp.status_code == 200:
+                            # Verify Content-Type is HTML
+                            content_type = p_resp.headers.get("Content-Type", "").lower()
+                            if "text/html" not in content_type:
+                                continue
+                            p_html = p_resp.text
+                            p_text = re.sub(r'<[^>]+>', ' ', p_html)
+                            p_contacts = self._extract_contacts(p_text, p_html)
+
+                            if p_contacts["emails"] or p_contacts["phones"]:
+                                contact_pages.append(url)
+                                emails.update(p_contacts["emails"])
+                                phones.update(p_contacts["phones"])
+                                whatsapp_numbers.update(p_contacts["whatsapp"])
+                                addresses.extend(p_contacts["addresses"])
+                                social_links.update(p_contacts["social_links"])
+
+                            visited.add(url)
+                            pages_crawled += 1
+                    except Exception as e:
+                        logger.debug("httpx_page_crawl_failed", url=url, error=str(e))
+                        continue
+
+            except Exception as e:
+                logger.info("httpx_homepage_failed", website=website, error=str(e))
+                raise
+
+        if not emails and not phones and not whatsapp_numbers and not social_links:
+            logger.info("httpx_no_contacts_found", website=website)
+            return None
+
+        return {
+            "company": company or name_hint,
+            "emails": list(emails),
+            "phones": list(phones),
+            "whatsapp_numbers": list(whatsapp_numbers),
+            "addresses": list(set(addresses))[:5],
+            "social_links": list(social_links),
+            "contact_pages": contact_pages,
+            "pages_crawled": pages_crawled,
+        }
+
+    async def _scrape_website(
+        self,
+        website: str,
+        name_hint: str,
+    ) -> dict[str, Any] | None:
+        """Scrape website for contact information."""
+        # Try HTTPX first
+        try:
+            parsed = urlparse(website)
+            urls_to_try = [website]
+            if parsed.netloc.startswith("www."):
+                alt_netloc = parsed.netloc[4:]
+                alt_url = parsed._replace(netloc=alt_netloc).geturl()
+                urls_to_try.append(alt_url)
+            else:
+                alt_netloc = "www." + parsed.netloc
+                alt_url = parsed._replace(netloc=alt_netloc).geturl()
+                urls_to_try.append(alt_url)
+
+            for url in urls_to_try:
+                try:
+                    result = await self._scrape_website_httpx(url, name_hint)
+                    if result:
+                        logger.info("enrichment_httpx_success", website=url)
+                        return result
+                except Exception as e:
+                    logger.debug("enrichment_httpx_attempt_failed", url=url, error=str(e))
+                    continue
+        except Exception as e:
+            logger.warning("enrichment_httpx_error", website=website, error=str(e))
+
+        # Fallback to Playwright
+        logger.info("enrichment_playwright_fallback", website=website)
+        company = ""
+        emails: set[str] = set()
+        phones: set[str] = set()
+        whatsapp_numbers: set[str] = set()
+        addresses: list[str] = []
+        social_links: set[str] = set()
+        contact_pages: list[str] = []
+        pages_crawled = 0
+
+        parsed = urlparse(website)
+        urls_to_try = [website]
+        if parsed.netloc.startswith("www."):
+            alt_netloc = parsed.netloc[4:]
+            alt_url = parsed._replace(netloc=alt_netloc).geturl()
+            urls_to_try.append(alt_url)
+        else:
+            alt_netloc = "www." + parsed.netloc
+            alt_url = parsed._replace(netloc=alt_netloc).geturl()
+            urls_to_try.append(alt_url)
+
+        playwright_success = False
+        for url in urls_to_try:
+            logger.info("enrichment_playwright_attempt", url=url)
+            try:
+                async with self.browser.website_page(url) as page:
+                    # Visit homepage
+                    await page.goto(url, timeout=15000, wait_until="domcontentloaded")
+                    await asyncio.sleep(2)
+
+                    # Get title
+                    try:
+                        title = await page.title()
+                        company = title.split("|")[0].split("-")[0].strip()
+                    except Exception:
+                        company = name_hint
+
+                    # Extract from homepage
+                    html = await page.content()
+                    text = await page.evaluate("() => document.body?.innerText || ''")
+
+                    contacts = self._extract_contacts(text, html)
+                    emails.update(contacts["emails"])
+                    phones.update(contacts["phones"])
+                    whatsapp_numbers.update(contacts["whatsapp"])
+                    addresses.extend(contacts["addresses"])
+                    social_links.update(contacts["social_links"])
+                    pages_crawled = 1
+
+                    # Find contact links
+                    links = self._find_contact_links(html, url)
+
+                    # Crawl high-value pages
+                    visited = {url}
+                    max_pages = settings.max_pages_per_site
+
+                    for page_url in links[:max_pages - 1]:
+                        if page_url in visited or pages_crawled >= max_pages:
+                            continue
+
+                        # Skip if we have enough contacts
+                        if len(emails) >= 3 and len(phones) >= 3:
+                            break
+
+                        try:
+                            await page.goto(page_url, timeout=15000, wait_until="domcontentloaded")
+                            await asyncio.sleep(2)
+
+                            html = await page.content()
+                            text = await page.evaluate("() => document.body?.innerText || ''")
+
+                            page_contacts = self._extract_contacts(text, html)
+
+                            if page_contacts["emails"] or page_contacts["phones"]:
+                                contact_pages.append(page_url)
+                                emails.update(page_contacts["emails"])
+                                phones.update(page_contacts["phones"])
+                                whatsapp_numbers.update(page_contacts["whatsapp"])
+                                addresses.extend(page_contacts["addresses"])
+                                social_links.update(page_contacts["social_links"])
+
+                            visited.add(page_url)
+                            pages_crawled += 1
+
+                        except Exception:
+                            continue
+
+                    playwright_success = True
+                    break
+
+            except Exception as e:
+                logger.warning("playwright_attempt_failed", url=url, error=str(e))
+                continue
+
+        if not playwright_success:
+            logger.warning("website_scrape_failed", website=website)
+            return None
+
+        if not emails and not phones and not whatsapp_numbers and not social_links:
+            return None
+
+        return {
+            "company": company,
+            "emails": list(emails),
+            "phones": list(phones),
+            "whatsapp_numbers": list(whatsapp_numbers),
+            "addresses": list(set(addresses))[:5],
+            "social_links": list(social_links),
+            "contact_pages": contact_pages,
+            "pages_crawled": pages_crawled,
+        }
+
+    def _extract_contacts(self, text: str, html: str) -> dict[str, Any]:
+        """Extract contact information from text and HTML."""
+        results = {
+            "emails": set(),
+            "phones": set(),
+            "whatsapp": set(),
+            "social_links": set(),
+            "addresses": [],
+        }
+
+        # Extract emails
+        results["emails"] = set(EMAIL_PATTERN.findall(text))
+
+        # Extract mailto links
+        mailto_matches = re.findall(r'mailto:([^"\s<>]+)', html, re.I)
+        results["emails"].update(mailto_matches)
+
+        # Extract phones
+        phone_matches = PHONE_PATTERN.findall(text)
+        for match in phone_matches:
+            if isinstance(match, tuple):
+                match = match[0] if match[0] else match[1]
+            if match:
+                cleaned = clean_phone(match)
+                if len(cleaned) >= 10:
+                    results["phones"].add(cleaned)
+
+        # Extract tel links
+        tel_matches = re.findall(r'tel:([\d+\-]+)', html, re.I)
+        for tel in tel_matches:
+            cleaned = clean_phone(tel)
+            if len(cleaned) >= 10:
+                results["phones"].add(cleaned)
+
+        # Extract WhatsApp
+        whatsapp_matches = re.findall(
+            r'wa\.me/(\d+)|whatsapp\.com/send\?phone=(\d+)',
+            html,
+            re.I
+        )
+        for match in whatsapp_matches:
+            num = match[0] if match[0] else match[1]
+            if num:
+                results["whatsapp"].add(clean_phone(num))
+
+        # Extract social links
+        for platform, pattern in SOCIAL_PATTERNS.items():
+            matches = pattern.findall(html)
+            for match in matches:
+                if match.startswith("http"):
+                    results["social_links"].add(match)
+                else:
+                    results["social_links"].add(f"https://{match}")
+
+        return results
+
+    def _find_contact_links(self, html: str, base_url: str) -> list[str]:
+        """Find contact-related links."""
+        links = []
+        parsed_base = urlparse(base_url)
+        base_domain = parsed_base.netloc
+        base_domain_clean = base_domain[4:] if base_domain.startswith("www.") else base_domain
+        seen = set()
+
+        href_matches = re.findall(r'href=["\']([^"\']+)["\']', html)
+
+        # Ignore common static asset extensions to prevent unnecessary crawls and regex hangs
+        ignored_extensions = (
+            '.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.pdf', 
+            '.zip', '.tar', '.gz', '.woff', '.woff2', '.ttf', '.eot', '.ico', 
+            '.mp4', '.avi', '.mov', '.mp3', '.wav', '.xml', '.json', '.txt',
+            '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.map'
+        )
+
+        for href in href_matches:
+            if href.startswith("#") or href.startswith("javascript:"):
+                continue
+
+            # Skip asset URLs
+            parsed_href = urlparse(href)
+            path = parsed_href.path.lower()
+            if path.endswith(ignored_extensions):
+                continue
+
+            if href.startswith("http"):
+                full_url = href
+            elif href.startswith("/"):
+                full_url = f"{parsed_base.scheme}://{base_domain}{href}"
+            else:
+                full_url = urljoin(base_url, href)
+
+            parsed_link = urlparse(full_url)
+            link_domain = parsed_link.netloc
+            link_domain_clean = link_domain[4:] if link_domain.startswith("www.") else link_domain
+
+            if base_domain_clean != link_domain_clean:
+                continue
+
+            # Prioritize high-value pages
+            priority = 2 if self._is_high_value_page(full_url) else 1
+
+            if full_url not in seen:
+                seen.add(full_url)
+                links.append((priority, full_url))
+
+        # Sort by priority
+        links.sort(key=lambda x: -x[0])
+        return [url for _, url in links]
+
+    def _is_high_value_page(self, url: str) -> bool:
+        """Check if URL is a high-value contact page."""
+        url_lower = url.lower()
+        return any(keyword in url_lower for keyword in HIGH_VALUE_PAGES)

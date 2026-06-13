@@ -1,0 +1,127 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+
+# Ruff
+.ruff_cache/
+
+# MyPy
+.mypy_cache/
+
+# Pyre
+.pyre/
+
+# Type Checking
+.dmypy.json
+
+# Build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# Jupyter
+.ipynb_checkpoints/
+
+# FastAPI
+instance/
+
+# Alembic
+alembic/versions/*.pyc
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
+
+# Docker
+docker-compose.override.yml
+
+# Node (if frontend exists)
+node_modules/
+.next/
+dist/
+
+# Test Reports
+coverage.xml
+nosetests.xml
+test-results/
+
+# Generated Files
+*.csv
+*.xlsx
+*.jsonl
+
+# Scraper Outputs
+downloads/
+
+# Secrets
+secrets/
+credentials/
+*.pem
+*.key
+*.crt
+
+# Local Config
+config.local.py
+settings.local.py
+
+
+
+# Runtime data
+
+# Crawl data
+crawled_pages/
+scraped_data/
+screenshots/
+
+# Playwright
+playwright-report/
+test-results/
+
+# Browser profiles
+browser_data/
+user_data/
+
+# Celery
+celerybeat-schedule
+
+# Redis dumps
+dump.rdb

@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leads Platform v2 - API Documentation</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0b0f19;
+            --bg-secondary: #111827;
+            --bg-glass: rgba(17, 24, 39, 0.7);
+            --border-glass: rgba(255, 255, 255, 0.08);
+            --text-primary: #f3f4f6;
+            --text-secondary: #9ca3af;
+            --accent-blue: #3b82f6;
+            --accent-green: #10b981;
+            --accent-purple: #8b5cf6;
+            --accent-red: #ef4444;
+            --accent-yellow: #f59e0b;
+            --accent-blue-glow: rgba(59, 130, 246, 0.15);
+            --code-bg: #1e293b;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            display: flex;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Sidebar navigation */
+        .sidebar {
+            width: 300px;
+            background-color: var(--bg-secondary);
+            border-right: 1px solid var(--border-glass);
+            position: fixed;
+            top: 0;
+            bottom: 0;
+            left: 0;
+            padding: 2.5rem 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+            overflow-y: auto;
+            z-index: 10;
+        }
+
+        .logo-section {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 1.25rem;
+            box-shadow: 0 0 20px rgba(59, 130, 246, 0.4);
+        }
+
+        .logo-text {
+            font-size: 1.3rem;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            background: linear-gradient(to right, #ffffff, #9ca3af);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .nav-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .nav-title {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+
+        .nav-item a {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem 1rem;
+            color: var(--text-secondary);
+            text-decoration: none;
+            border-radius: 10px;
+            font-size: 0.95rem;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+
+        .nav-item a:hover {
+            color: var(--text-primary);
+            background-color: rgba(255, 255, 255, 0.03);
+        }
+
+        .nav-item.active a {
+            color: #ffffff;
+            background: linear-gradient(90deg, var(--accent-blue-glow), transparent);
+            border-left: 3px solid var(--accent-blue);
+        }
+
+        .method-badge {
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            min-width: 50px;
+            text-align: center;
+        }
+
+        .method-badge.get { background-color: rgba(16, 185, 129, 0.15); color: var(--accent-green); }
+        .method-badge.post { background-color: rgba(59, 130, 246, 0.15); color: var(--accent-blue); }
+        .method-badge.delete { background-color: rgba(239, 68, 68, 0.15); color: var(--accent-red); }
+        .method-badge.ws { background-color: rgba(139, 92, 246, 0.15); color: var(--accent-purple); }
+
+        /* Main content */
+        .content {
+            margin-left: 300px;
+            padding: 3rem 4rem;
+            flex-grow: 1;
+            max-width: 1200px;
+        }
+
+        .header {
+            margin-bottom: 4rem;
+            position: relative;
+        }
+
+        .header h1 {
+            font-size: 3rem;
+            font-weight: 800;
+            margin-bottom: 1rem;
+            letter-spacing: -1px;
+            background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .header p {
+            color: var(--text-secondary);
+            font-size: 1.15rem;
+            line-height: 1.6;
+            max-width: 800px;
+        }
+
+        .section {
+            margin-bottom: 5rem;
+            scroll-margin-top: 2rem;
+        }
+
+        .section-title {
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            border-bottom: 1px solid var(--border-glass);
+            padding-bottom: 0.75rem;
+        }
+
+        .endpoint-card {
+            background-color: var(--bg-secondary);
+            border: 1px solid var(--border-glass);
+            border-radius: 16px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .endpoint-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 30px rgba(59, 130, 246, 0.05);
+        }
+
+        .endpoint-header {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .endpoint-path {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #ffffff;
+        }
+
+        .endpoint-desc {
+            color: var(--text-secondary);
+            font-size: 1rem;
+            line-height: 1.6;
+            margin-bottom: 1.5rem;
+        }
+
+        .grid-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+
+        @media (max-width: 1024px) {
+            .grid-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Params and responses tables */
+        .params-section h4 {
+            font-size: 0.95rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-secondary);
+            margin-bottom: 0.75rem;
+        }
+
+        .params-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+
+        .params-table th, .params-table td {
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .params-table th {
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+        }
+
+        .param-name {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-blue);
+            font-weight: 500;
+        }
+
+        .param-type {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-purple);
+            font-size: 0.8rem;
+        }
+
+        .param-req {
+            color: var(--accent-red);
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .param-opt {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+        }
+
+        /* Code block container */
+        .code-container {
+            display: flex;
+            flex-direction: column;
+            background-color: var(--code-bg);
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid var(--border-glass);
+        }
+
+        .code-tabs {
+            display: flex;
+            background-color: rgba(0, 0, 0, 0.2);
+            border-bottom: 1px solid var(--border-glass);
+        }
+
+        .code-tab {
+            padding: 0.75rem 1.25rem;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            border: none;
+            background: none;
+            cursor: pointer;
+            font-family: 'Outfit', sans-serif;
+            transition: all 0.2s ease;
+        }
+
+        .code-tab.active {
+            color: #ffffff;
+            background-color: var(--code-bg);
+            border-bottom: 2px solid var(--accent-blue);
+        }
+
+        .code-content {
+            padding: 1.5rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            color: #e2e8f0;
+            overflow-x: auto;
+            white-space: pre;
+        }
+
+        .auth-note {
+            background: linear-gradient(90deg, rgba(245, 158, 11, 0.1), transparent);
+            border-left: 3px solid var(--accent-yellow);
+            padding: 1rem 1.5rem;
+            border-radius: 0 12px 12px 0;
+            margin-bottom: 2rem;
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+
+        .auth-note code {
+            font-family: 'JetBrains Mono', monospace;
+            background-color: rgba(255, 255, 255, 0.05);
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: var(--accent-yellow);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <div class="logo-section">
+            <div class="logo-icon">L</div>
+            <div class="logo-text">Leads Scraper V2</div>
+        </div>
+
+        <div>
+            <div class="nav-title">Introduction</div>
+            <ul class="nav-list">
+                <li class="nav-item active"><a href="#getting-started">Getting Started</a></li>
+                <li class="nav-item"><a href="#authentication">Authentication</a></li>
+            </ul>
+        </div>
+
+        <div>
+            <div class="nav-title">Job Endpoints</div>
+            <ul class="nav-list">
+                <li class="nav-item"><a href="#create-job"><span class="method-badge post">Post</span> /jobs</a></li>
+                <li class="nav-item"><a href="#list-jobs"><span class="method-badge get">Get</span> /jobs</a></li>
+                <li class="nav-item"><a href="#get-job"><span class="method-badge get">Get</span> /jobs/{id}</a></li>
+                <li class="nav-item"><a href="#delete-job"><span class="method-badge delete">Del</span> /jobs/{id}</a></li>
+                <li class="nav-item"><a href="#pause-job"><span class="method-badge post">Post</span> /jobs/{id}/pause</a></li>
+                <li class="nav-item"><a href="#resume-job"><span class="method-badge post">Post</span> /jobs/{id}/resume</a></li>
+                <li class="nav-item"><a href="#retry-job"><span class="method-badge post">Post</span> /jobs/{id}/retry</a></li>
+                <li class="nav-item"><a href="#job-enriched"><span class="method-badge get">Get</span> /jobs/{id}/enriched</a></li>
+                <li class="nav-item"><a href="#job-raw"><span class="method-badge get">Get</span> /jobs/{id}/raw</a></li>
+                <li class="nav-item"><a href="#queue-stats"><span class="method-badge get">Get</span> /jobs/{id}/stats</a></li>
+                <li class="nav-item"><a href="#stream-ws"><span class="method-badge ws">WS</span> /ws/jobs/{id}</a></li>
+            </ul>
+        </div>
+
+        <div>
+            <div class="nav-title">Lead Endpoints</div>
+            <ul class="nav-list">
+                <li class="nav-item"><a href="#delete-lead"><span class="method-badge delete">Del</span> /leads/{id}</a></li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="content">
+        <div class="header">
+            <h1>API Reference Documentation</h1>
+            <p>Welcome to the Leads Scraper v2 API reference. This service offers high-performance parallel Google Maps discovery and website enrichment using context page pooling.</p>
+        </div>
+
+        <!-- Getting Started -->
+        <div class="section" id="getting-started">
+            <h2 class="section-title">Getting Started</h2>
+            <p style="color: var(--text-secondary); line-height: 1.6; margin-bottom: 1.5rem;">
+                All API requests should be sent to the base URL: <code>http://localhost:8000</code>. Response payloads are returned in JSON format.
+            </p>
+        </div>
+
+        <!-- Authentication -->
+        <div class="section" id="authentication">
+            <h2 class="section-title">Authentication</h2>
+            <div class="auth-note">
+                Security: Requests to all jobs and leads endpoints require the API Key to be passed inside the HTTP headers as <code>X-API-Key</code>.
+            </div>
+            <p style="color: var(--text-secondary); line-height: 1.6; margin-bottom: 2rem;">
+                The default secret key is <code>change-me-in-production</code>. Authentication is bypassed automatically for health checking and WebSocket connection handshakes.
+            </p>
+        </div>
+
+        <!-- Job Endpoints -->
+        <div class="section" id="jobs">
+            <h2 class="section-title">Job Management</h2>
+
+            <!-- Create Job -->
+            <div class="endpoint-card" id="create-job">
+                <div class="endpoint-header">
+                    <span class="method-badge post">POST</span>
+                    <span class="endpoint-path">/jobs</span>
+                </div>
+                <div class="endpoint-desc">Create and start a new background discovery and enrichment job immediately.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Request JSON Body</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Parameter</th>
+                                    <th>Type</th>
+                                    <th>Status</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">name</td>
+                                    <td class="param-type">string</td>
+                                    <td class="param-req">required</td>
+                                    <td>A descriptive title for the job.</td>
+                                </tr>
+                                <tr>
+                                    <td class="param-name">keywords</td>
+                                    <td class="param-type">array[str]</td>
+                                    <td class="param-req">required</td>
+                                    <td>Search terms (e.g. ["dentist"]).</td>
+                                </tr>
+                                <tr>
+                                    <td class="param-name">areas</td>
+                                    <td class="param-type">array[str]</td>
+                                    <td class="param-req">required</td>
+                                    <td>Search locations (e.g. ["London"]).</td>
+                                </tr>
+                                <tr>
+                                    <td class="param-name">max_results</td>
+                                    <td class="param-type">integer</td>
+                                    <td class="param-opt">optional (50)</td>
+                                    <td>Limit of leads to return.</td>
+                                </tr>
+                                <tr>
+                                    <td class="param-name">concurrency</td>
+                                    <td class="param-type">integer</td>
+                                    <td class="param-opt">optional (3)</td>
+                                    <td>Number of parallel workers.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                            <button class="code-tab">Python</button>
+                        </div>
+                        <div class="code-content">curl -X POST http://localhost:8000/jobs \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: change-me-in-production" \
+  -d '{
+    "name": "Dentists in London",
+    "keywords": ["dentist"],
+    "areas": ["London"],
+    "max_results": 10,
+    "concurrency": 3
+  }'</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- List Jobs -->
+            <div class="endpoint-card" id="list-jobs">
+                <div class="endpoint-header">
+                    <span class="method-badge get">GET</span>
+                    <span class="endpoint-path">/jobs</span>
+                </div>
+                <div class="endpoint-desc">List paginated history of all scraping jobs. Can be filtered by job status.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Query Parameters</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Parameter</th>
+                                    <th>Type</th>
+                                    <th>Status</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">status</td>
+                                    <td class="param-type">string</td>
+                                    <td class="param-opt">optional</td>
+                                    <td>Filter by status: pending, running, completed, failed, paused.</td>
+                                </tr>
+                                <tr>
+                                    <td class="param-name">limit</td>
+                                    <td class="param-type">integer</td>
+                                    <td class="param-opt">optional (50)</td>
+                                    <td>Pagination page limit size.</td>
+                                </tr>
+                                <tr>
+                                    <td class="param-name">offset</td>
+                                    <td class="param-type">integer</td>
+                                    <td class="param-opt">optional (0)</td>
+                                    <td>Pagination offset.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl http://localhost:8000/jobs?limit=10 \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Get Job -->
+            <div class="endpoint-card" id="get-job">
+                <div class="endpoint-header">
+                    <span class="method-badge get">GET</span>
+                    <span class="endpoint-path">/jobs/{job_id}</span>
+                </div>
+                <div class="endpoint-desc">Fetch the configuration, status, and running details of a single job.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Path Variables</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Variable</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">job_id</td>
+                                    <td class="param-type">UUID</td>
+                                    <td>Unique identifier of the job.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl http://localhost:8000/jobs/d09f6df8-1be2-44df-9d55-12cf5ee4e341 \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Delete Job -->
+            <div class="endpoint-card" id="delete-job">
+                <div class="endpoint-header">
+                    <span class="method-badge delete">DELETE</span>
+                    <span class="endpoint-path">/jobs/{job_id}</span>
+                </div>
+                <div class="endpoint-desc">Deletes a job from the database. This cascades and automatically purges all collections (raw results) and enriched leads associated with the job ID. Cancels background execution first if the job is running.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Path Variables</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Variable</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">job_id</td>
+                                    <td class="param-type">UUID</td>
+                                    <td>Unique identifier of the job to delete.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl -X DELETE http://localhost:8000/jobs/d09f6df8-1be2-44df-9d55-12cf5ee4e341 \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Pause Job -->
+            <div class="endpoint-card" id="pause-job">
+                <div class="endpoint-header">
+                    <span class="method-badge post">POST</span>
+                    <span class="endpoint-path">/jobs/{job_id}/pause</span>
+                </div>
+                <div class="endpoint-desc">Pause / Stop a running job by cancelling the background scheduler and scraping workers.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Path Variables</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Variable</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">job_id</td>
+                                    <td class="param-type">UUID</td>
+                                    <td>Job identifier to pause.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl -X POST http://localhost:8000/jobs/d09f6df8-1be2-44df-9d55-12cf5ee4e341/pause \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Resume Job -->
+            <div class="endpoint-card" id="resume-job">
+                <div class="endpoint-header">
+                    <span class="method-badge post">POST</span>
+                    <span class="endpoint-path">/jobs/{job_id}/resume</span>
+                </div>
+                <div class="endpoint-desc">Resume a paused job, re-spawning parallel discovery and enrichment workers.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Path Variables</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Variable</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">job_id</td>
+                                    <td class="param-type">UUID</td>
+                                    <td>Job identifier to resume.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl -X POST http://localhost:8000/jobs/d09f6df8-1be2-44df-9d55-12cf5ee4e341/resume \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Retry Job -->
+            <div class="endpoint-card" id="retry-job">
+                <div class="endpoint-header">
+                    <span class="method-badge post">POST</span>
+                    <span class="endpoint-path">/jobs/{job_id}/retry</span>
+                </div>
+                <div class="endpoint-desc">Retry a failed job. Cleans up errors and restarts the queue pipeline.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Path Variables</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Variable</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">job_id</td>
+                                    <td class="param-type">UUID</td>
+                                    <td>Job identifier to retry.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl -X POST http://localhost:8000/jobs/d09f6df8-1be2-44df-9d55-12cf5ee4e341/retry \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Job Enriched Results -->
+            <div class="endpoint-card" id="job-enriched">
+                <div class="endpoint-header">
+                    <span class="method-badge get">GET</span>
+                    <span class="endpoint-path">/jobs/{job_id}/results/enriched</span>
+                </div>
+                <div class="endpoint-desc">Retrieve the list of fully enriched leads (emails, phones, social links, crawls) for a job.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Query Parameters</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Parameter</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">limit</td>
+                                    <td class="param-type">integer</td>
+                                    <td>Limit output (default 100).</td>
+                                </tr>
+                                <tr>
+                                    <td class="param-name">offset</td>
+                                    <td class="param-type">integer</td>
+                                    <td>Offset output (default 0).</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl http://localhost:8000/jobs/d09f6df8-1be2-44df-9d55-12cf5ee4e341/results/enriched \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Job Raw Results -->
+            <div class="endpoint-card" id="job-raw">
+                <div class="endpoint-header">
+                    <span class="method-badge get">GET</span>
+                    <span class="endpoint-path">/jobs/{job_id}/results/raw</span>
+                </div>
+                <div class="endpoint-desc">Retrieve raw business collections discovered from Google Maps prior to website enrichment.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Query Parameters</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Parameter</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">limit</td>
+                                    <td class="param-type">integer</td>
+                                    <td>Limit output.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl http://localhost:8000/jobs/d09f6df8-1be2-44df-9d55-12cf5ee4e341/results/raw \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Queue Stats -->
+            <div class="endpoint-card" id="queue-stats">
+                <div class="endpoint-header">
+                    <span class="method-badge get">GET</span>
+                    <span class="endpoint-path">/jobs/{job_id}/queue-stats</span>
+                </div>
+                <div class="endpoint-desc">Get the real-time active status, worker counts, and queue depth sizes of a pipeline job.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Path Variables</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Variable</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">job_id</td>
+                                    <td class="param-type">UUID</td>
+                                    <td>Identifier to check.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl http://localhost:8000/jobs/d09f6df8-1be2-44df-9d55-12cf5ee4e341/queue-stats \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stream results -->
+            <div class="endpoint-card" id="stream-ws">
+                <div class="endpoint-header">
+                    <span class="method-badge ws">WS</span>
+                    <span class="endpoint-path">/ws/jobs/{job_id}</span>
+                </div>
+                <div class="endpoint-desc">Establish a persistent WebSocket connection to receive real-time JSON stream updates of job status, progress percentages, and queue depth modifications. Does not require X-API-Key header verification (supports browser WebSocket standard).</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>WebSocket Parameters</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Path Variable</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">job_id</td>
+                                    <td class="param-type">UUID</td>
+                                    <td>The unique job identifier to stream.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">Javascript</button>
+                        </div>
+                        <div class="code-content">const socket = new WebSocket('ws://localhost:8000/ws/jobs/' + jobId);
+
+socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    console.log("Real-time Update:", data);
+};</div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Lead Endpoints -->
+        <div class="section" id="leads">
+            <h2 class="section-title">Lead Management</h2>
+
+            <!-- Delete Lead -->
+            <div class="endpoint-card" id="delete-lead">
+                <div class="endpoint-header">
+                    <span class="method-badge delete">DELETE</span>
+                    <span class="endpoint-path">/leads/{lead_id}</span>
+                </div>
+                <div class="endpoint-desc">Purge a single enriched lead from the database.</div>
+                
+                <div class="grid-container">
+                    <div class="params-section">
+                        <h4>Path Variables</h4>
+                        <table class="params-table">
+                            <thead>
+                                <tr>
+                                    <th>Variable</th>
+                                    <th>Type</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td class="param-name">lead_id</td>
+                                    <td class="param-type">UUID</td>
+                                    <td>Unique identifier of the lead.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="code-container">
+                        <div class="code-tabs">
+                            <button class="code-tab active">cURL</button>
+                        </div>
+                        <div class="code-content">curl -X DELETE http://localhost:8000/leads/775efc02-45e1-45df-bbca-55449efce102 \
+  -H "X-API-Key: change-me-in-production"</div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+</body>
+</html>
