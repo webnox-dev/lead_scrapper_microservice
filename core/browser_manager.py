@@ -83,17 +83,19 @@ class BrowserManager:
                     )
                 else:
                     # Fall back to Playwright-managed browser
-                    self._browser = await self._playwright.chromium.launch(
-                        channel=settings.browser_channel,
-                        headless=settings.browser_headless,
-                        args=[
+                    launch_args = {
+                        "headless": settings.browser_headless,
+                        "args": [
                             "--disable-gpu",
                             "--disable-dev-shm-usage",
                             "--no-sandbox",
                             "--disable-web-security",
                             "--disable-features=IsolateOrigins,site-per-process",
                         ],
-                    )
+                    }
+                    if settings.browser_channel:
+                        launch_args["channel"] = settings.browser_channel
+                    self._browser = await self._playwright.chromium.launch(**launch_args)
 
                 # Create default context
                 default_context = await self._create_context("default")
