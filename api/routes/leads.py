@@ -13,6 +13,125 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 
+def detect_country(address: str | None, area: str | None) -> str:
+    """Detect country from the actual business address only.
+    
+    NOTE: We intentionally do NOT use `area` (the search query location)
+    because Google Maps often returns local results even when the user
+    searches for a different country (e.g. searching 'digital marketing
+    agency in united states' still returns Coimbatore businesses).
+    """
+    if not address:
+        return ""
+        
+    addr = address.lower()
+    
+    # Indian indicators - check first since most results are Indian
+    indian_states = [
+        "tamil nadu", "karnataka", "maharashtra", "kerala", "andhra pradesh",
+        "telangana", "west bengal", "rajasthan", "uttar pradesh", "gujarat",
+        "madhya pradesh", "bihar", "punjab", "haryana", "odisha", "assam",
+        "jharkhand", "chhattisgarh", "uttarakhand", "himachal pradesh",
+        "goa", "tripura", "meghalaya", "manipur", "nagaland", "mizoram",
+        "arunachal pradesh", "sikkim", "delhi", "chandigarh",
+    ]
+    indian_cities = [
+        "mumbai", "chennai", "bangalore", "bengaluru", "hyderabad", "kolkata",
+        "pune", "ahmedabad", "jaipur", "coimbatore", "tiruppur", "kochi",
+        "lucknow", "surat", "indore", "bhopal", "noida", "gurgaon", "gurugram",
+        "thiruvananthapuram", "visakhapatnam", "nagpur", "thane", "patna",
+        "vadodara", "ludhiana", "agra", "madurai", "varanasi", "erode",
+        "salem", "tiruchirappalli", "trichy", "mysuru", "mysore",
+    ]
+    # Indian PIN codes (6 digits)
+    import re
+    if re.search(r'\b\d{6}\b', addr):
+        return "India"
+    if any(s in addr for s in indian_states):
+        return "India"
+    if any(c in addr for c in indian_cities):
+        return "India"
+    if "india" in addr:
+        return "India"
+    
+    # US indicators
+    us_states = [
+        "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+        "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+        "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+        "maine", "maryland", "massachusetts", "michigan", "minnesota",
+        "mississippi", "missouri", "montana", "nebraska", "nevada",
+        "new hampshire", "new jersey", "new mexico", "new york",
+        "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+        "pennsylvania", "rhode island", "south carolina", "south dakota",
+        "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+        "west virginia", "wisconsin", "wyoming",
+    ]
+    # US ZIP codes (5 digits or 5+4)
+    if re.search(r'\b\d{5}(?:-\d{4})?\b', addr) and not re.search(r'\b\d{6}\b', addr):
+        return "United States"
+    if any(x in addr for x in ["united states", "usa", " us ", "u.s.a"]):
+        return "United States"
+    if any(s in addr for s in us_states):
+        return "United States"
+        
+    # Other countries
+    if any(x in addr for x in ["united kingdom", "london", "great britain", "england", "scotland", "wales"]):
+        return "United Kingdom"
+    if "canada" in addr:
+        return "Canada"
+    if "germany" in addr or "deutschland" in addr:
+        return "Germany"
+    if "australia" in addr:
+        return "Australia"
+    if "singapore" in addr:
+        return "Singapore"
+    if "uae" in addr or "dubai" in addr or "emirates" in addr:
+        return "United Arab Emirates"
+        
+    # If we can't determine, return empty (don't guess)
+    return ""
+
+
+def _extract_city_from_address(address: str | None) -> str | None:
+    """Extract the city name from a full address string.
+    
+    Parses comma-separated address parts and returns the most likely
+    city component (skipping street details and postal codes).
+    """
+    if not address:
+        return None
+    
+    import re
+    parts = [p.strip() for p in address.split(",") if p.strip()]
+    
+    # Walk backwards through parts — city is usually before state/country
+    # Skip parts that look like postal codes, country names, or state names
+    skip_patterns = re.compile(
+        r'^\d{5,6}$|^\d{5}-\d{4}$|^india$|^united states$|^usa$|^uk$|^canada$|^australia$',
+        re.IGNORECASE,
+    )
+    
+    for part in reversed(parts):
+        clean = part.strip()
+        # Remove trailing postal codes embedded in the part (e.g. "Tamil Nadu 641025")
+        clean_check = re.sub(r'\s+\d{5,6}$', '', clean).strip()
+        if skip_patterns.match(clean_check):
+            continue
+        # Skip state names (these are typically the second-to-last part)
+        # But a city is also fine — return the first non-skip part from the end
+        # that doesn't look like a street address (has "road", "floor", "no.")
+        lower = clean_check.lower()
+        if any(x in lower for x in ["floor", "road", " rd", "no.", "plot", "street", " st,", "block", "sector", "nagar"]):
+            continue
+        return clean_check
+    
+    # Fallback: return second-to-last part if available
+    if len(parts) >= 2:
+        return parts[-2].strip()
+    return None
+
+
 @router.delete("/{lead_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_lead(
     lead_id: UUID,
@@ -115,9 +234,9 @@ async def list_leads(
             "job_id": str(lead.job_id),
             "business_name": lead.company_name,
             "address": lead.address,
-            "city": lead.collection.area if lead.collection else None,
+            "city": _extract_city_from_address(lead.address),
             "state": None,
-            "country": "India",
+            "country": detect_country(lead.address, None),
             "category": lead.collection.keyword if lead.collection else None,
             "rating": lead.collection.rating if lead.collection else None,
             "review_count": lead.collection.review_count if lead.collection else None,

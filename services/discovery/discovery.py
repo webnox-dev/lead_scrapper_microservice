@@ -57,7 +57,7 @@ class DiscoveryService:
 
         # Search Google Maps
         async with self.browser.page() as page:
-            success = await self.browser.goto_maps_search(search_term, page)
+            success = await self.browser.goto_maps_search(search_term, page, area=area)
             if not success:
                 logger.warning("maps_search_failed", term=search_term)
                 return []

@@ -44,12 +44,69 @@ HIGH_VALUE_PAGES = [
 ]
 
 
-def clean_phone(phone: str) -> str:
-    """Clean and standardize phone number."""
+import phonenumbers
+
+def clean_phone(phone: str, default_region: str = "IN") -> str:
+    """Clean and standardize phone number using Google's phonenumbers library.
+    
+    Returns:
+    - 10-digit number for Indian numbers (no +91 prefix) as expected by the DB/UI.
+    - E.164 format (e.g. +971543470278) for international numbers.
+    """
+    if not phone:
+        return ""
+    try:
+        # Normalize/clean spaces and brackets first so phonenumbers can parse it cleanly
+        cleaned_input = phone.strip()
+        # Parse using the detected default region
+        parsed = phonenumbers.parse(cleaned_input, default_region)
+        if phonenumbers.is_possible_number(parsed):
+            if parsed.country_code == 91:
+                # Standard Indian 10-digit national number
+                return str(parsed.national_number)
+            else:
+                # E.164 format for international
+                return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+    except Exception:
+        pass
+    
+    # Fallback to simple cleaning if phonenumbers fails
     digits = re.sub(r"\D", "", phone)
-    if digits.startswith("91") and len(digits) > 10:
-        digits = digits[2:]
-    return digits[-10:] if len(digits) >= 10 else digits
+    if phone.strip().startswith("+"):
+        return f"+{digits}"
+    return digits
+
+
+def is_valid_phone_number(raw_phone: str, cleaned_phone: str, default_region: str = "IN") -> bool:
+    """Validate extracted phone number to filter out false positives."""
+    if not cleaned_phone:
+        return False
+        
+    try:
+        # Parse and check validity
+        parsed = phonenumbers.parse(cleaned_phone, default_region)
+        if phonenumbers.is_valid_number(parsed):
+            check_digits = str(parsed.national_number)
+            # Filter out dummy repeating digits (e.g. 9999999999 or any digit repeating 6+ times)
+            if re.search(r"(\d)\1{5,}", check_digits):
+                return False
+            # Filter out common sequential test sequences
+            if check_digits in ("1234567890", "0123456789", "9876543210"):
+                return False
+            return True
+    except Exception:
+        pass
+        
+    # Fallback validation for edge cases
+    check_digits = cleaned_phone.lstrip("+")
+    if not (7 <= len(check_digits) <= 15):
+        return False
+    if re.search(r"(\d)\1{5,}", check_digits):
+        return False
+    if check_digits in ("1234567890", "0123456789", "9876543210"):
+        return False
+    return True
+
 
 
 class EnrichmentService:
@@ -59,16 +116,44 @@ class EnrichmentService:
         self.db = db
         self.browser = get_browser_manager()
 
+    async def _verify_email_address(self, email: str) -> bool:
+        """Verify email syntax and deliverability (MX records) asynchronously."""
+        email = email.strip()
+        
+        # Blacklist of placeholder emails
+        placeholder_blacklist = {
+            "email@example.com", "username@domain.com", "yourname@domain.com",
+            "email@domain.com", "name@domain.com", "test@test.com", "info@example.com",
+            "user@domain.com", "yourname@yourdomain.com", "test@domain.com"
+        }
+        if email.lower() in placeholder_blacklist:
+            return False
+            
+        def check():
+            try:
+                from email_validator import validate_email, EmailNotValidError
+                validate_email(email, check_deliverability=True, timeout=2.5)
+                return True
+            except EmailNotValidError:
+                return False
+            except Exception:
+                # If there is a temporary network glitch or query timeout, default to True for safety
+                return True
+                
+        return await asyncio.to_thread(check)
+
     async def enrich_website(
         self,
         website: str,
         name_hint: str = "",
+        default_region: str = "IN",
     ) -> dict[str, Any] | None:
         """Enrich a single website — extract contacts.
 
         Args:
             website: The website URL to scrape.
             name_hint: Business name hint for fallback.
+            default_region: Detected country code.
 
         Returns:
             Dict with emails, phones, social_links, etc. or None if failed.
@@ -117,12 +202,19 @@ class EnrichmentService:
                 logger.warning("enrichment_cache_lookup_failed", website=website, error=str(e))
 
         print(f"🌐 Scraping: {website}")
-        result = await self._scrape_website(website, name_hint)
+        result = await self._scrape_website(website, name_hint, default_region)
 
         if result:
+            raw_emails = result.get("emails", [])
+            verified_emails = []
+            for email in raw_emails:
+                if await self._verify_email_address(email):
+                    verified_emails.append(email)
+            result["emails"] = verified_emails
+
             emails = result.get("emails", [])
             phones = result.get("phones", [])
-            print(f"✅ {name_hint or website}: {len(emails)} emails, {len(phones)} phones")
+            print(f"✅ {name_hint or website}: {len(emails)} emails (verified), {len(phones)} phones")
         else:
             print(f"❌ {name_hint or website}: no contacts found")
 
@@ -132,110 +224,7 @@ class EnrichmentService:
         self,
         website: str,
         name_hint: str,
-    ) -> dict[str, Any] | None:
-        """Attempt to scrape the website using fast HTTP requests first."""
-        logger.info("httpx_enrichment_attempt", website=website)
-        company = ""
-        emails: set[str] = set()
-        phones: set[str] = set()
-        whatsapp_numbers: set[str] = set()
-        addresses: list[str] = []
-        social_links: set[str] = set()
-        contact_pages: list[str] = []
-        pages_crawled = 0
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
-
-        import httpx
-        timeout = httpx.Timeout(15.0, connect=10.0)
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=timeout) as client:
-            try:
-                resp = await client.get(website)
-                if resp.status_code != 200:
-                    logger.info("httpx_homepage_non_200", website=website, status=resp.status_code)
-                    return None
-
-                html = resp.text
-                
-                title_match = re.search(r"<title>(.*?)</title>", html, re.I)
-                if title_match:
-                    company = title_match.group(1).split("|")[0].split("-")[0].strip()
-                else:
-                    company = name_hint
-
-                text = re.sub(r'<[^>]+>', ' ', html)
-                contacts = self._extract_contacts(text, html)
-                
-                emails.update(contacts["emails"])
-                phones.update(contacts["phones"])
-                whatsapp_numbers.update(contacts["whatsapp"])
-                addresses.extend(contacts["addresses"])
-                social_links.update(contacts["social_links"])
-                pages_crawled = 1
-
-                links = self._find_contact_links(html, website)
-                max_pages = settings.max_pages_per_site
-
-                visited = {website}
-                for url in links[:max_pages - 1]:
-                    if url in visited or pages_crawled >= max_pages:
-                        continue
-
-                    if len(emails) >= 3 and len(phones) >= 3:
-                        break
-
-                    try:
-                        p_resp = await client.get(url)
-                        if p_resp.status_code == 200:
-                            p_html = p_resp.text
-                            p_text = re.sub(r'<[^>]+>', ' ', p_html)
-                            p_contacts = self._extract_contacts(p_text, p_html)
-
-                            if p_contacts["emails"] or p_contacts["phones"]:
-                                contact_pages.append(url)
-                                emails.update(p_contacts["emails"])
-                                phones.update(p_contacts["phones"])
-                                whatsapp_numbers.update(p_contacts["whatsapp"])
-                                addresses.extend(p_contacts["addresses"])
-                                social_links.update(p_contacts["social_links"])
-
-                            visited.add(url)
-                            pages_crawled += 1
-                    except Exception as e:
-                        logger.debug("httpx_page_crawl_failed", url=url, error=str(e))
-                        continue
-
-            except Exception as e:
-                logger.info("httpx_homepage_failed", website=website, error=str(e))
-                raise
-
-        if not emails and not phones and not whatsapp_numbers:
-            logger.info("httpx_no_contacts_found", website=website)
-            return None
-
-        return {
-            "company": company or name_hint,
-            "emails": list(emails),
-            "phones": list(phones),
-            "whatsapp_numbers": list(whatsapp_numbers),
-            "addresses": list(set(addresses))[:5],
-            "social_links": list(social_links),
-            "contact_pages": contact_pages,
-            "pages_crawled": pages_crawled,
-        }
-
-    async def _scrape_website_httpx(
-        self,
-        website: str,
-        name_hint: str,
+        default_region: str = "IN",
     ) -> dict[str, Any] | None:
         """Attempt to scrape the website using fast HTTP requests first."""
         logger.info("httpx_enrichment_attempt", website=website)
@@ -282,7 +271,7 @@ class EnrichmentService:
                     company = name_hint
 
                 text = re.sub(r'<[^>]+>', ' ', html)
-                contacts = self._extract_contacts(text, html)
+                contacts = self._extract_contacts(text, html, default_region)
                 
                 emails.update(contacts["emails"])
                 phones.update(contacts["phones"])
@@ -311,9 +300,9 @@ class EnrichmentService:
                                 continue
                             p_html = p_resp.text
                             p_text = re.sub(r'<[^>]+>', ' ', p_html)
-                            p_contacts = self._extract_contacts(p_text, p_html)
+                            p_contacts = self._extract_contacts(p_text, p_html, default_region)
 
-                            if p_contacts["emails"] or p_contacts["phones"]:
+                            if p_contacts["emails"] or p_contacts["phones"] or p_contacts["social_links"]:
                                 contact_pages.append(url)
                                 emails.update(p_contacts["emails"])
                                 phones.update(p_contacts["phones"])
@@ -350,6 +339,7 @@ class EnrichmentService:
         self,
         website: str,
         name_hint: str,
+        default_region: str = "IN",
     ) -> dict[str, Any] | None:
         """Scrape website for contact information."""
         # Try HTTPX first
@@ -367,7 +357,7 @@ class EnrichmentService:
 
             for url in urls_to_try:
                 try:
-                    result = await self._scrape_website_httpx(url, name_hint)
+                    result = await self._scrape_website_httpx(url, name_hint, default_region)
                     if result:
                         logger.info("enrichment_httpx_success", website=url)
                         return result
@@ -419,7 +409,7 @@ class EnrichmentService:
                     html = await page.content()
                     text = await page.evaluate("() => document.body?.innerText || ''")
 
-                    contacts = self._extract_contacts(text, html)
+                    contacts = self._extract_contacts(text, html, default_region)
                     emails.update(contacts["emails"])
                     phones.update(contacts["phones"])
                     whatsapp_numbers.update(contacts["whatsapp"])
@@ -449,9 +439,9 @@ class EnrichmentService:
                             html = await page.content()
                             text = await page.evaluate("() => document.body?.innerText || ''")
 
-                            page_contacts = self._extract_contacts(text, html)
+                            page_contacts = self._extract_contacts(text, html, default_region)
 
-                            if page_contacts["emails"] or page_contacts["phones"]:
+                            if page_contacts["emails"] or page_contacts["phones"] or page_contacts["social_links"]:
                                 contact_pages.append(page_url)
                                 emails.update(page_contacts["emails"])
                                 phones.update(page_contacts["phones"])
@@ -490,8 +480,8 @@ class EnrichmentService:
             "pages_crawled": pages_crawled,
         }
 
-    def _extract_contacts(self, text: str, html: str) -> dict[str, Any]:
-        """Extract contact information from text and HTML."""
+    def _extract_contacts(self, text: str, html: str, default_region: str = "IN") -> dict[str, Any]:
+        """Extract contact information from text and HTML using phonenumbers."""
         results = {
             "emails": set(),
             "phones": set(),
@@ -501,27 +491,45 @@ class EnrichmentService:
         }
 
         # Extract emails
-        results["emails"] = set(EMAIL_PATTERN.findall(text))
+        raw_emails = set(EMAIL_PATTERN.findall(text))
 
         # Extract mailto links
         mailto_matches = re.findall(r'mailto:([^"\s<>]+)', html, re.I)
-        results["emails"].update(mailto_matches)
+        raw_emails.update(mailto_matches)
 
-        # Extract phones
-        phone_matches = PHONE_PATTERN.findall(text)
-        for match in phone_matches:
-            if isinstance(match, tuple):
-                match = match[0] if match[0] else match[1]
-            if match:
-                cleaned = clean_phone(match)
-                if len(cleaned) >= 10:
+        ignored_email_extensions = (
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", 
+            ".js", ".css", ".pdf", ".zip", ".tar", ".gz", ".ico",
+            ".mp4", ".mov", ".avi", ".mp3", ".wav"
+        )
+        for email in raw_emails:
+            email_lower = email.lower().strip()
+            if not email_lower.endswith(ignored_email_extensions):
+                results["emails"].add(email)
+
+        # Extract phones using Google's PhoneNumberMatcher
+        try:
+            for match in phonenumbers.PhoneNumberMatcher(text, default_region):
+                cleaned = clean_phone(match.raw_string, default_region)
+                if cleaned and is_valid_phone_number(match.raw_string, cleaned, default_region):
                     results["phones"].add(cleaned)
+        except Exception as e:
+            logger.warning("phonenumbers_matcher_failed", error=str(e))
+            # Fallback to regex
+            phone_matches = PHONE_PATTERN.findall(text)
+            for match in phone_matches:
+                if isinstance(match, tuple):
+                    match = match[0] if match[0] else match[1]
+                if match:
+                    cleaned = clean_phone(match, default_region)
+                    if is_valid_phone_number(match, cleaned, default_region):
+                        results["phones"].add(cleaned)
 
         # Extract tel links
-        tel_matches = re.findall(r'tel:([\d+\-]+)', html, re.I)
+        tel_matches = re.findall(r'tel:([\d+\-\s()]+)', html, re.I)
         for tel in tel_matches:
-            cleaned = clean_phone(tel)
-            if len(cleaned) >= 10:
+            cleaned = clean_phone(tel, default_region)
+            if is_valid_phone_number(tel, cleaned, default_region):
                 results["phones"].add(cleaned)
 
         # Extract WhatsApp
@@ -533,7 +541,8 @@ class EnrichmentService:
         for match in whatsapp_matches:
             num = match[0] if match[0] else match[1]
             if num:
-                results["whatsapp"].add(clean_phone(num))
+                cleaned = clean_phone(num, default_region)
+                results["whatsapp"].add(cleaned)
 
         # Extract social links
         for platform, pattern in SOCIAL_PATTERNS.items():

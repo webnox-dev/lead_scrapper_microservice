@@ -19,8 +19,41 @@ from db.models.collection import Collection
 from db.models.lead import Lead
 from services.discovery import DiscoveryService
 from services.enrichment import EnrichmentService
+from services.enrichment.enrichment import clean_phone
 
 logger = get_logger(__name__)
+
+
+def detect_country_iso(address: str | None, area: str | None) -> str:
+    """Detect the 2-letter ISO country code from address or search area."""
+    full_text = f"{address or ''} {area or ''}".lower()
+    
+    if any(x in full_text for x in ["usa", "united states", "america"]):
+        return "US"
+    if any(x in full_text for x in ["uk", "united kingdom", "london", "great britain", "england"]):
+        return "GB"
+    if "canada" in full_text:
+        return "CA"
+    if "germany" in full_text:
+        return "DE"
+    if "australia" in full_text:
+        return "AU"
+    if "singapore" in full_text:
+        return "SG"
+    if any(x in full_text for x in ["uae", "dubai", "emirates", "united arab emirates"]):
+        return "AE"
+    
+    # Check for Indian states / cities in address
+    indian_states = [
+        "tamil nadu", "karnataka", "maharashtra", "kerala", "andhra pradesh",
+        "telangana", "west bengal", "rajasthan", "uttar pradesh", "gujarat",
+        "madhya pradesh", "bihar", "punjab", "haryana", "odisha", "assam",
+        "delhi", "coimbatore", "chennai", "bangalore", "mumbai"
+    ]
+    if any(s in full_text for s in indian_states) or "india" in full_text:
+        return "IN"
+        
+    return "IN"
 
 # How many leads to buffer before flushing to DB
 COMMIT_BATCH_SIZE = 1
@@ -405,28 +438,36 @@ class PipelineManager:
                 nonlocal new_added_count
                 maps_url = biz.get("maps_url", "").split("?")[0].strip()
                 name = biz["name"].lower().strip()
+                # Detect country code for formatting & validation
+                country_iso = detect_country_iso(biz.get("address"), area)
+
                 phone = biz.get("phone", "").strip() if biz.get("phone") else ""
+                phone_cleaned = clean_phone(phone, country_iso) if phone else ""
+                # Keep the cleaned phone on the biz dictionary
+                if phone_cleaned:
+                    biz["phone"] = phone_cleaned
+
                 website = biz.get("website", "").lower().strip() if biz.get("website") else ""
 
                 # Deduplication Check
                 if maps_url and maps_url in self.seen_maps_urls.get(job_id, set()):
                     logger.info("dedupe_skip_maps_url", job_id=job_id, maps_url=maps_url)
                     return
-                if phone and (name, phone) in self.seen_names_phones.get(job_id, set()):
-                    logger.info("dedupe_skip_name_phone", job_id=job_id, name=name, phone=phone)
+                if phone_cleaned and (name, phone_cleaned) in self.seen_names_phones.get(job_id, set()):
+                    logger.info("dedupe_skip_name_phone", job_id=job_id, name=name, phone=phone_cleaned)
                     return
                 if website and (name, website) in self.seen_names_websites.get(job_id, set()):
                     logger.info("dedupe_skip_name_website", job_id=job_id, name=name, website=website)
                     return
-                if not phone and not website and name in self.seen_names.get(job_id, set()):
+                if not phone_cleaned and not website and name in self.seen_names.get(job_id, set()):
                     logger.info("dedupe_skip_name_only", job_id=job_id, name=name)
                     return
 
                 # Mark as seen
                 if maps_url:
                     self.seen_maps_urls[job_id].add(maps_url)
-                if phone:
-                    self.seen_names_phones[job_id].add((name, phone))
+                if phone_cleaned:
+                    self.seen_names_phones[job_id].add((name, phone_cleaned))
                 if website:
                     self.seen_names_websites[job_id].add((name, website))
                 self.seen_names[job_id].add(name)
@@ -437,6 +478,7 @@ class PipelineManager:
 
                 col_id = uuid4()
                 biz["collection_id"] = str(col_id)
+                biz["area"] = area
 
                 async with db_lock:
                     pending.append(Collection(
@@ -444,6 +486,7 @@ class PipelineManager:
                         job_id=job_id,
                         google_maps_id=biz.get("maps_url", "")[:255],
                         company_name=biz["name"],
+                        address=biz.get("address"),
                         phone=biz.get("phone"),
                         website=biz.get("website"),
                         rating=biz.get("rating"),
@@ -504,12 +547,16 @@ class PipelineManager:
                 website = biz.get("website", "")
                 result = None
 
+                # Detect country code for formatting & validation
+                country_iso = detect_country_iso(biz.get("address"), biz.get("area"))
+
                 if website:
                     try:
                         result = await asyncio.wait_for(
                             enrichment.enrich_website(
                                 website=website,
                                 name_hint=biz["name"],
+                                default_region=country_iso,
                             ),
                             timeout=45.0
                         )
@@ -535,16 +582,22 @@ class PipelineManager:
                 else:
                     stats.failed += 1
 
+                # Clean the initial Google Maps phone using country context
+                fallback_phone = []
+                if biz.get("phone"):
+                    cleaned_fallback = clean_phone(biz["phone"], country_iso)
+                    if cleaned_fallback:
+                        fallback_phone = [cleaned_fallback]
+
                 pending.append(Lead(
                     id=uuid4(),
                     job_id=job_id,
                     collection_id=UUID(biz["collection_id"]) if biz.get("collection_id") else None,
                     company_name=biz["name"],
                     website=website,
+                    address=biz.get("address"),
                     emails=result.get("emails", []) if result else [],
-                    phones=result.get("phones", []) if result else (
-                        [biz["phone"]] if biz.get("phone") else []
-                    ),
+                    phones=result.get("phones", []) if result else fallback_phone,
                     whatsapp_numbers=result.get("whatsapp_numbers", []) if result else [],
                     social_links=result.get("social_links", []) if result else [],
                     pages_crawled=result.get("pages_crawled", 0) if result else 0,

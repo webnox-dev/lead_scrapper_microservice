@@ -264,15 +264,52 @@ class BrowserManager:
             finally:
                 await self._release_page(page, context_id)
 
+    # Country code mapping for Google Maps geo-targeting
+    _COUNTRY_GEO = {
+        "united states": {"gl": "us", "hl": "en", "lat": 39.8283, "lng": -98.5795},
+        "usa": {"gl": "us", "hl": "en", "lat": 39.8283, "lng": -98.5795},
+        "united kingdom": {"gl": "uk", "hl": "en", "lat": 51.5074, "lng": -0.1278},
+        "uk": {"gl": "uk", "hl": "en", "lat": 51.5074, "lng": -0.1278},
+        "canada": {"gl": "ca", "hl": "en", "lat": 56.1304, "lng": -106.3468},
+        "australia": {"gl": "au", "hl": "en", "lat": -25.2744, "lng": 133.7751},
+        "germany": {"gl": "de", "hl": "de", "lat": 51.1657, "lng": 10.4515},
+        "singapore": {"gl": "sg", "hl": "en", "lat": 1.3521, "lng": 103.8198},
+        "uae": {"gl": "ae", "hl": "en", "lat": 25.2048, "lng": 55.2708},
+        "dubai": {"gl": "ae", "hl": "en", "lat": 25.2048, "lng": 55.2708},
+        "india": {"gl": "in", "hl": "en", "lat": 20.5937, "lng": 78.9629},
+    }
+
+    def _detect_geo_from_area(self, area: str) -> dict[str, Any] | None:
+        """Detect geo-targeting params from the search area string."""
+        area_lower = area.lower().strip()
+        for key, geo in self._COUNTRY_GEO.items():
+            if key in area_lower:
+                return geo
+        return None
+
     async def goto_maps_search(
         self,
         keyword: str,
         page: Page,
         timeout: int = 120000,
+        area: str = "",
     ) -> bool:
-        """Navigate to Google Maps search."""
+        """Navigate to Google Maps search with geo-targeting."""
         try:
-            url = f"https://www.google.com/maps/search/{quote(keyword)}"
+            # Build URL with geo-targeting params if area contains a country
+            geo = self._detect_geo_from_area(area) if area else None
+            
+            params = ""
+            if geo:
+                params = f"?gl={geo['gl']}&hl={geo['hl']}"
+                # Spoof geolocation so Google Maps centers on that country
+                await page.context.set_geolocation({
+                    "latitude": geo["lat"],
+                    "longitude": geo["lng"],
+                })
+                await page.context.grant_permissions(["geolocation"])
+
+            url = f"https://www.google.com/maps/search/{quote(keyword)}{params}"
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
 
             # Wait for results feed or direct place page redirect
@@ -290,10 +327,14 @@ class BrowserManager:
     async def scroll_maps_results(
         self,
         page: Page,
-        max_scrolls: int = 50,
+        max_scrolls: int = 100,
         target_count: int | None = None,
     ) -> list[str]:
         """Scroll through Google Maps results and collect place URLs."""
+        if target_count is not None:
+            # Allow up to 2x scrolls of the target count to make sure we load enough results
+            max_scrolls = max(max_scrolls, target_count * 2)
+
         urls = []
         seen_urls = set()
         no_new_count = 0
@@ -363,8 +404,8 @@ class BrowserManager:
                 except Exception:
                     pass
 
-                # Stop if no new results for 5 consecutive scrolls
-                if no_new_count >= 5:
+                # Stop if no new results for 8 consecutive scrolls
+                if no_new_count >= 8:
                     logger.info("maps_no_new_results", total=len(urls))
                     break
 
@@ -428,30 +469,50 @@ class BrowserManager:
             details = await page.evaluate(
                 """
                 () => {
-                    const result = { name: "", website: "", phone: "", rating: null, review_count: null };
+                    const result = { name: "", website: "", phone: "", rating: null, review_count: null, address: "" };
                     const h1 = document.querySelector("h1");
                     if (h1) {
                         result.name = h1.textContent.trim();
                     }
 
-                    // Extract phone
-                    const allElements = document.querySelectorAll("*");
-                    let phoneText = "";
-                    for (const el of allElements) {
-                        phoneText += " " + (
-                            el.innerText ||
-                            el.textContent ||
-                            el.getAttribute("aria-label") ||
-                            el.getAttribute("data-value") ||
-                            ""
-                        );
+                    // Extract address
+                    const addressEl = document.querySelector('[data-item-id="address"]');
+                    if (addressEl) {
+                        result.address = addressEl.textContent.trim();
                     }
 
-                    const phoneMatch = phoneText.match(
-                        /(\\+91[\\s-]?\\d{5}[\\s-]?\\d{5})|(\\d{5}[\\s-]?\\d{5})|(\\d{10})/
-                    );
-                    if (phoneMatch) {
-                        result.phone = phoneMatch[0].replace(/\\s/g, "").replace(/-/g, "");
+                    // Extract phone
+                    // 1. Try to find the Google Maps phone button/link directly
+                    const gMapsPhoneEl = document.querySelector('[data-item-id^="phone:tel:"]');
+                    if (gMapsPhoneEl) {
+                        const itemId = gMapsPhoneEl.getAttribute("data-item-id");
+                        result.phone = itemId.replace("phone:tel:", "").trim();
+                    } else {
+                        // 2. Try tel: links
+                        const telLink = document.querySelector('a[href^="tel:"]');
+                        if (telLink) {
+                            result.phone = telLink.getAttribute("href").replace("tel:", "").trim();
+                        } else {
+                            // 3. Fallback: Scan text for a phone number match
+                            const allElements = document.querySelectorAll("*");
+                            let phoneText = "";
+                            for (const el of allElements) {
+                                phoneText += " " + (
+                                    el.innerText ||
+                                    el.textContent ||
+                                    el.getAttribute("aria-label") ||
+                                    el.getAttribute("data-value") ||
+                                    ""
+                                );
+                            }
+                            // Generic regex matching international, national, and local formats (7 to 15 digits)
+                            const phoneMatch = phoneText.match(
+                                /(?:\\+\\d{1,4}[-.\\s]?)?\\(?\\d{2,6}\\)?[-.\\s]?\\d{3,9}[-.\\s]?\\d{3,9}/
+                            );
+                            if (phoneMatch) {
+                                result.phone = phoneMatch[0].trim();
+                            }
+                        }
                     }
 
                     // Extract website
@@ -575,6 +636,7 @@ class BrowserManager:
                 "phone": details.get("phone", ""),
                 "rating": details.get("rating"),
                 "review_count": details.get("review_count"),
+                "address": details.get("address", ""),
             }
 
         except Exception as e:
