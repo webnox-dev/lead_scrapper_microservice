@@ -35,7 +35,7 @@ class JobCreate(BaseModel):
             if "name" not in data or not data["name"]:
                 keyword = data.get("keyword") or (data.get("keywords")[0] if data.get("keywords") else "Scraping Job")
                 location = data.get("location") or (data.get("areas")[0] if data.get("areas") else "All Locations")
-                data["name"] = f"Scrape: {keyword} in {location}"
+                data["name"] = f"{keyword} {location}"
 
             # Ensure concurrency is present
             if "concurrency" not in data:

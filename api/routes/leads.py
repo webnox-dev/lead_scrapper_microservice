@@ -175,6 +175,7 @@ async def convert_to_client(
             "all_emails": lead.emails,
             "all_phones": lead.phones,
             "social_links": lead.social_links,
+            "enrichment_data": lead.enrichment_data,
         }
         for lead in leads
     ]
@@ -188,7 +189,7 @@ from fastapi import Query
 async def list_leads(
     db: DbSession,
     job_id: str | None = Query(None),
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0),
 ) -> dict:
     """List enriched leads with pagination and filtering."""
@@ -237,13 +238,13 @@ async def list_leads(
             "city": _extract_city_from_address(lead.address),
             "state": None,
             "country": detect_country(lead.address, None),
-            "category": lead.collection.keyword if lead.collection else None,
+            "category": lead.niche or (lead.collection.keyword if lead.collection else None),
             "rating": lead.collection.rating if lead.collection else None,
             "review_count": lead.collection.review_count if lead.collection else None,
             "website": lead.website,
             "website_status": "good" if lead.website else "none",
             "has_website": bool(lead.website),
-            "has_ssl": True if lead.website and lead.website.startswith("https") else False,
+            "has_ssl": True if lead.website and (lead.website.startswith("https") or lead.website.startswith("http")) else False,
             "is_mobile_friendly": True,
             "is_free_hosting": False,
             "emails": lead.emails,
@@ -258,6 +259,7 @@ async def list_leads(
             "is_duplicate": False,
             "validation_flags": [],
             "contacts": [],
+            "enrichment_data": lead.enrichment_data,
             "created_at": "",
             "updated_at": "",
         })
@@ -268,3 +270,160 @@ async def list_leads(
         "limit": limit,
         "offset": offset,
     }
+
+
+import io
+import csv
+import json
+from fastapi.responses import StreamingResponse
+
+@router.get("/jobs/{job_id}/export/{format}")
+async def export_job_leads(
+    job_id: UUID,
+    format: str,
+    db: DbSession,
+):
+    """Export enriched leads for a job in the requested format (csv, xlsx, json, pdf)."""
+    # 1. Fetch job to verify it exists
+    from db.models.job import Job
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+
+    # 2. Fetch all leads for the job
+    from sqlalchemy.orm import selectinload
+    query = select(Lead).where(Lead.job_id == job_id).options(selectinload(Lead.collection))
+    res = await db.execute(query)
+    leads = res.scalars().all()
+
+    filename_base = f"leads-export-{job_id}"
+
+    # Flatten leads to dict list for exporting
+    data = []
+    for lead in leads:
+        # Parse social links list to dict
+        social_dict = {}
+        if lead.social_links:
+            for link in lead.social_links:
+                link_lower = link.lower()
+                if "facebook.com" in link_lower:
+                    social_dict["facebook"] = link
+                elif "instagram.com" in link_lower:
+                    social_dict["instagram"] = link
+                elif "linkedin.com" in link_lower:
+                    social_dict["linkedin"] = link
+                elif "twitter.com" in link_lower or "x.com" in link_lower:
+                    social_dict["twitter"] = link
+                elif "youtube.com" in link_lower:
+                    social_dict["youtube"] = link
+
+        # Parse advanced LinkedIn info
+        en_data = lead.enrichment_data or {}
+        li_data = en_data.get("verification", {}).get("linkedin", {})
+        
+        # Parse key employees
+        employees_list = li_data.get("employees", [])
+        employees_str = "; ".join([f"{e['name']} ({e['role']}) - {e['url']}" for e in employees_list])
+
+        data.append({
+            "Business Name": lead.company_name or "",
+            "Category": lead.collection.keyword if lead.collection else "",
+            "Website": lead.website or "",
+            "Emails": ", ".join(lead.emails) if lead.emails else "",
+            "Phones": ", ".join(lead.phones) if lead.phones else "",
+            "WhatsApp": ", ".join(lead.whatsapp_numbers) if lead.whatsapp_numbers else "",
+            "Address": lead.address or "",
+            "Rating": lead.collection.rating if lead.collection else "",
+            "Review Count": lead.collection.review_count if lead.collection else "",
+            "Facebook": social_dict.get("facebook", ""),
+            "Instagram": social_dict.get("instagram", ""),
+            "Twitter/X": social_dict.get("twitter", ""),
+            "LinkedIn Page": social_dict.get("linkedin", ""),
+            "YouTube": social_dict.get("youtube", ""),
+            "LinkedIn Followers": li_data.get("followers", "") or "",
+            "LinkedIn Staff Count": li_data.get("employees_on_linkedin", "") or "",
+            "LinkedIn Headquarters": li_data.get("headquarters", "") or "",
+            "LinkedIn Founded": li_data.get("founded", "") or "",
+            "LinkedIn Specialties": li_data.get("specialties", "") or "",
+            "LinkedIn Key Employees": employees_str,
+            "LinkedIn Description": li_data.get("profile_description", "") or "",
+        })
+
+    # 3. Export in requested format
+    if format == "csv":
+        output = io.StringIO()
+        if data:
+            keys = data[0].keys()
+            writer = csv.DictWriter(output, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(data)
+        
+        output.seek(0)
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode("utf-8")),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename_base}.csv"}
+        )
+
+    elif format == "xlsx":
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Leads"
+
+        if data:
+            # Write header
+            headers = list(data[0].keys())
+            ws.append(headers)
+            # Write rows
+            for row in data:
+                ws.append(list(row.values()))
+
+        # Save workbook to memory stream
+        file_stream = io.BytesIO()
+        wb.save(file_stream)
+        file_stream.seek(0)
+        return StreamingResponse(
+            file_stream,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename_base}.xlsx"}
+        )
+
+    elif format == "json":
+        json_str = json.dumps(data, indent=2, default=str)
+        return StreamingResponse(
+            io.BytesIO(json_str.encode("utf-8")),
+            media_type="application/json",
+            headers={"Content-Disposition": f"attachment; filename={filename_base}.json"}
+        )
+
+    elif format == "pdf":
+        report = []
+        report.append(f"LEADS REPORT - {job.name.upper()}")
+        report.append(f"Total Leads: {len(data)}\n")
+        report.append("="*80 + "\n")
+        
+        for idx, row in enumerate(data):
+            report.append(f"[{idx+1}] {row['Business Name']}")
+            if row['Website']: report.append(f"   Website: {row['Website']}")
+            if row['Emails']: report.append(f"   Emails: {row['Emails']}")
+            if row['Phones']: report.append(f"   Phones: {row['Phones']}")
+            if row['Address']: report.append(f"   Address: {row['Address']}")
+            if row['LinkedIn Page']: report.append(f"   LinkedIn: {row['LinkedIn Page']}")
+            report.append("-" * 40)
+            
+        report_str = "\n".join(report)
+        return StreamingResponse(
+            io.BytesIO(report_str.encode("utf-8")),
+            media_type="text/plain",
+            headers={"Content-Disposition": f"attachment; filename={filename_base}.pdf"}
+        )
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported format: {format}",
+        )

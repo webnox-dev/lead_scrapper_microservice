@@ -58,53 +58,70 @@ class BrowserManager:
     async def start(self) -> None:
         """Start the browser."""
         async with self._lock:
-            if self._browser:
+            if "default" in self._contexts:
                 return
 
             try:
                 self._playwright = await async_playwright().start()
                 
-                # Try to use system Chrome first (for Ubuntu compatibility)
+                # Check for system Chrome path
                 import shutil
+                import os
                 chrome_path = shutil.which("google-chrome") or shutil.which("chromium-browser") or shutil.which("chromium")
+                
+                # Ensure the user data profile directory exists
+                user_data_dir = "./user_profile"
+                os.makedirs(user_data_dir, exist_ok=True)
+                
+                launch_args = {
+                    "user_data_dir": user_data_dir,
+                    "headless": settings.browser_headless,
+                    "user_agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "viewport": {"width": 1920, "height": 1080},
+                    "args": [
+                        "--disable-gpu",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                        "--disable-web-security",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                    ],
+                }
                 
                 if chrome_path:
                     logger.info("using_system_chrome", path=chrome_path)
-                    self._browser = await self._playwright.chromium.launch(
-                        executable_path=chrome_path,
-                        headless=settings.browser_headless,
-                        args=[
-                            "--disable-gpu",
-                            "--disable-dev-shm-usage",
-                            "--no-sandbox",
-                            "--disable-web-security",
-                            "--disable-features=IsolateOrigins,site-per-process",
-                        ],
-                    )
-                else:
-                    # Fall back to Playwright-managed browser
-                    launch_args = {
-                        "headless": settings.browser_headless,
-                        "args": [
-                            "--disable-gpu",
-                            "--disable-dev-shm-usage",
-                            "--no-sandbox",
-                            "--disable-web-security",
-                            "--disable-features=IsolateOrigins,site-per-process",
-                        ],
-                    }
-                    if settings.browser_channel:
-                        launch_args["channel"] = settings.browser_channel
-                    self._browser = await self._playwright.chromium.launch(**launch_args)
+                    launch_args["executable_path"] = chrome_path
+                elif settings.browser_channel:
+                    launch_args["channel"] = settings.browser_channel
+                    
+                # Launch Chromium as a persistent browser context to share Google Account logins & cookies
+                logger.info("launching_persistent_browser_context", user_data_dir=user_data_dir)
+                context = await self._playwright.chromium.launch_persistent_context(**launch_args)
+                
+                # Block heavy resources on the persistent context
+                async def block_resources(route: Route) -> None:
+                    # Do NOT block stylesheets, as Google Maps scrolling container relies on CSS layouts to scroll and load more results.
+                    if route.request.resource_type in {
+                        "image",
+                        "font",
+                        "media",
+                    }:
+                        await route.abort()
+                    else:
+                        await route.continue_()
 
-                # Create default context
-                default_context = await self._create_context("default")
-                self._contexts["default"] = default_context
-
+                await context.route("**/*", block_resources)
+                
+                self._contexts["default"] = context
+                
                 logger.info(
                     "browser_started",
                     headless=settings.browser_headless,
                     using_system_chrome=chrome_path is not None,
+                    persistent=True,
                 )
 
             except Exception as e:
@@ -173,11 +190,11 @@ class BrowserManager:
 
         # Block heavy resources
         async def block_resources(route: Route) -> None:
+            # Do NOT block stylesheets, as Google Maps scrolling container relies on CSS layouts to scroll and load more results.
             if route.request.resource_type in {
                 "image",
                 "font",
                 "media",
-                "stylesheet",
             }:
                 await route.abort()
             else:
@@ -331,9 +348,8 @@ class BrowserManager:
         target_count: int | None = None,
     ) -> list[str]:
         """Scroll through Google Maps results and collect place URLs."""
-        if target_count is not None:
-            # Allow up to 2x scrolls of the target count to make sure we load enough results
-            max_scrolls = max(max_scrolls, target_count * 2)
+        # Always allow up to 300 scrolls to make sure we reach the end of the results list
+        max_scrolls = max(max_scrolls, 300)
 
         urls = []
         seen_urls = set()
@@ -388,10 +404,8 @@ class BrowserManager:
                 else:
                     no_new_count += 1
 
-                # Stop early if we reached target_count
-                if target_count is not None and len(urls) >= target_count:
-                    logger.info("maps_target_reached", total=len(urls), target=target_count)
-                    break
+                # No longer stopping early on target_count; scroll to the very end of Google Maps results list.
+                pass
 
                 # Check for end of list text
                 try:
@@ -536,22 +550,40 @@ class BrowserManager:
                         }
                     }
 
+                    // Helper to parse review count with optional K/M suffixes
+                    const parseReviewCount = (rawStr) => {
+                        if (!rawStr) return null;
+                        let cleanStr = rawStr.toLowerCase().replace(/[(),\\s]/g, "").replace(/,/g, "");
+                        if (cleanStr.includes("k")) {
+                            return Math.round(parseFloat(cleanStr.replace("k", "")) * 1000);
+                        }
+                        if (cleanStr.includes("m")) {
+                            return Math.round(parseFloat(cleanStr.replace("m", "")) * 1000000);
+                        }
+                        const num = parseInt(cleanStr, 10);
+                        return isNaN(num) ? null : num;
+                    };
+
                     // Extract rating & review count
                     try {
                         const ratingContainer = document.querySelector(".F7nice");
                         if (ratingContainer) {
-                            const ratingSpan = ratingContainer.querySelector("span[aria-hidden='true']");
-                            if (ratingSpan) {
-                                const parsedRating = parseFloat(ratingSpan.textContent.trim());
+                            const text = ratingContainer.textContent.trim();
+                            
+                            // Extract rating (usually the first number in the text, e.g. "4.9")
+                            const ratingMatch = text.match(/^([0-9.]+)/);
+                            if (ratingMatch) {
+                                const parsedRating = parseFloat(ratingMatch[1]);
                                 if (!isNaN(parsedRating)) {
                                     result.rating = parsedRating;
                                 }
                             }
                             
-                            const reviewSpan = ratingContainer.querySelector("span:not([aria-hidden='true'])");
-                            if (reviewSpan) {
-                                const parsedReviews = parseInt(reviewSpan.textContent.replace(/[(),\\s]/g, ""), 10);
-                                if (!isNaN(parsedReviews)) {
+                            // Extract review count (usually the text inside parentheses, e.g. "(1,234)" or "(4)")
+                            const reviewsMatch = text.match(/\\(([^)]+)\\)/);
+                            if (reviewsMatch) {
+                                const parsedReviews = parseReviewCount(reviewsMatch[1]);
+                                if (parsedReviews !== null) {
                                     result.review_count = parsedReviews;
                                 }
                             }
@@ -575,10 +607,10 @@ class BrowserManager:
                             const reviewsEl = document.querySelector('button[aria-label*="reviews"], span[aria-label*="reviews"]');
                             if (reviewsEl) {
                                 const label = reviewsEl.getAttribute("aria-label");
-                                const match = label.match(/([0-9,]+)\\s*reviews/i);
+                                const match = label.match(/([0-9,kKmM.]+)\\s*reviews/i);
                                 if (match) {
-                                    const parsedReviews = parseInt(match[1].replace(/,/g, ""), 10);
-                                    if (!isNaN(parsedReviews)) {
+                                    const parsedReviews = parseReviewCount(match[1]);
+                                    if (parsedReviews !== null) {
                                         result.review_count = parsedReviews;
                                     }
                                 }
@@ -598,8 +630,8 @@ class BrowserManager:
                         if (result.review_count === null) {
                             const rnb = document.querySelector('.RNBzgc');
                             if (rnb) {
-                                const parsedReviews = parseInt(rnb.textContent.replace(/[(),\\s]/g, ""), 10);
-                                if (!isNaN(parsedReviews)) {
+                                const parsedReviews = parseReviewCount(rnb.textContent);
+                                if (parsedReviews !== null) {
                                     result.review_count = parsedReviews;
                                 }
                             }

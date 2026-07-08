@@ -119,6 +119,8 @@ test-results/
 # Browser profiles
 browser_data/
 user_data/
+user_profile/
+test_user_profile/
 
 # Celery
 celerybeat-schedule

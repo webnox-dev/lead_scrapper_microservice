@@ -74,12 +74,8 @@ class DiscoveryService:
         if seen_urls:
             place_urls = [u for u in place_urls if u.split("?")[0].strip() not in seen_urls]
 
-        # Limit to the remaining number of leads needed
-        remaining_limit = max_results - len(seen_urls) if seen_urls else max_results
-        if remaining_limit > 0:
-            place_urls = place_urls[:remaining_limit]
-        else:
-            place_urls = []
+        # No longer limiting discovered leads; return all results found to get 100% of GMB leads.
+        pass
 
         # Process businesses concurrently
         results: list[dict[str, Any]] = []

@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.browser_manager import get_browser_manager
 from core.config import settings
 from core.logging import get_logger
+from services.enrichment.phone import verify_phone
+from services.enrichment.linkedin import verify_linkedin_profile
 
 logger = get_logger(__name__)
 
@@ -186,18 +188,51 @@ class EnrichmentService:
                     existing_lead.whatsapp_numbers or 
                     existing_lead.social_links
                 ):
-                    logger.info("enrichment_cache_hit", website=website, lead_id=str(existing_lead.id))
-                    print(f"⚡ Cache Hit: {website} (Reusing contacts)")
-                    return {
-                        "company": existing_lead.company_name or name_hint,
-                        "emails": existing_lead.emails,
-                        "phones": existing_lead.phones,
-                        "whatsapp_numbers": existing_lead.whatsapp_numbers,
-                        "addresses": [existing_lead.address] if existing_lead.address else [],
-                        "social_links": existing_lead.social_links,
-                        "contact_pages": existing_lead.enrichment_data.get("contact_pages", []) if existing_lead.enrichment_data else [],
-                        "pages_crawled": existing_lead.pages_crawled,
-                    }
+                    # Check if the cached enrichment data contains verification metadata
+                    cached_data = existing_lead.enrichment_data or {}
+                    has_verification = "verification" in cached_data
+                    has_advanced_linkedin = False
+                    if has_verification:
+                        linkedin_data = cached_data["verification"].get("linkedin", {})
+                        # If profile is verified, check if we have scraped advanced fields (like followers or headquarters)
+                        if linkedin_data.get("verified"):
+                            has_advanced_linkedin = "followers" in linkedin_data or "headquarters" in linkedin_data
+                        else:
+                            has_advanced_linkedin = True  # Not verified, so no advanced info needed
+                    
+                        # Filter out any newly classified invalid phones from the cached results
+                        cleaned_cached_phones = []
+                        for phone in (existing_lead.phones or []):
+                            v_res = verify_phone(phone, default_region)
+                            if v_res["valid"]:
+                                cleaned_cached_phones.append(v_res["cleaned"])
+                        
+                        # Also filter the verification details list
+                        v_details = cached_data["verification"].get("phones", [])
+                        filtered_v_details = []
+                        for item in v_details:
+                            v_res = verify_phone(item.get("cleaned", ""), default_region)
+                            if v_res["valid"]:
+                                filtered_v_details.append(v_res)
+                        cached_data["verification"]["phones"] = filtered_v_details
+
+                        logger.info("enrichment_cache_hit", website=website, lead_id=str(existing_lead.id))
+                        print(f"⚡ Cache Hit: {website} (Reusing contacts)")
+                        return {
+                            "company": existing_lead.company_name or name_hint,
+                            "website": existing_lead.website or website,
+                            "emails": existing_lead.emails,
+                            "phones": cleaned_cached_phones,
+                            "whatsapp_numbers": existing_lead.whatsapp_numbers,
+                            "addresses": [existing_lead.address] if existing_lead.address else [],
+                            "social_links": existing_lead.social_links,
+                            "contact_pages": cached_data.get("contact_pages", []),
+                            "pages_crawled": existing_lead.pages_crawled,
+                            "verification": cached_data["verification"],
+                        }
+                    else:
+                        logger.info("enrichment_cache_ignored_no_verification_or_advanced_details", website=website)
+                        print(f"⚡ Cache Ignored (No advanced verification data): {website}")
             except Exception as e:
                 logger.warning("enrichment_cache_lookup_failed", website=website, error=str(e))
 
@@ -215,6 +250,60 @@ class EnrichmentService:
             emails = result.get("emails", [])
             phones = result.get("phones", [])
             print(f"✅ {name_hint or website}: {len(emails)} emails (verified), {len(phones)} phones")
+
+            # --- Verification Phase ---
+            # 1. Verify Phone Numbers
+            verified_phones_details = []
+            valid_phones = []
+            for phone in phones:
+                v_res = verify_phone(phone, default_region)
+                verified_phones_details.append(v_res)
+                if v_res["valid"]:
+                    valid_phones.append(v_res["cleaned"])
+            
+            # Fallback check if the main place record has a phone that wasn't verified
+            if not valid_phones and result.get("phone"):
+                v_res = verify_phone(result["phone"], default_region)
+                verified_phones_details.append(v_res)
+                if v_res["valid"]:
+                    valid_phones.append(v_res["cleaned"])
+
+            if valid_phones:
+                result["phones"] = list(set(valid_phones))
+
+            # 2. LinkedIn Profile Verification (via DuckDuckGo)
+            linkedin_details = {
+                "verified": False,
+                "linkedin_url": None,
+                "name": None,
+                "role": None,
+                "company": None,
+                "matched_method": "NONE",
+            }
+            # Try searching by email
+            for email in verified_emails:
+                v_res = await verify_linkedin_profile(email=email, company_name=name_hint, verified_emails=verified_emails)
+                if v_res["verified"]:
+                    linkedin_details = v_res
+                    break
+            # Fallback to company name search if no email-based match
+            if not linkedin_details["verified"] and name_hint:
+                v_res = await verify_linkedin_profile(email=None, company_name=name_hint, verified_emails=verified_emails)
+                if v_res["verified"]:
+                    linkedin_details = v_res
+
+            # Add verified LinkedIn URL to social links if found
+            if linkedin_details["verified"] and linkedin_details["linkedin_url"]:
+                social_links = result.get("social_links", [])
+                if linkedin_details["linkedin_url"] not in social_links:
+                    social_links.append(linkedin_details["linkedin_url"])
+                result["social_links"] = social_links
+
+            # Save verification metadata
+            result["verification"] = {
+                "phones": verified_phones_details,
+                "linkedin": linkedin_details,
+            }
         else:
             print(f"❌ {name_hint or website}: no contacts found")
 
@@ -326,6 +415,7 @@ class EnrichmentService:
 
         return {
             "company": company or name_hint,
+            "website": str(resp.url),
             "emails": list(emails),
             "phones": list(phones),
             "whatsapp_numbers": list(whatsapp_numbers),
@@ -378,6 +468,7 @@ class EnrichmentService:
         contact_pages: list[str] = []
         pages_crawled = 0
 
+        final_website_url = website
         parsed = urlparse(website)
         urls_to_try = [website]
         if parsed.netloc.startswith("www."):
@@ -397,6 +488,7 @@ class EnrichmentService:
                     # Visit homepage
                     await page.goto(url, timeout=15000, wait_until="domcontentloaded")
                     await asyncio.sleep(2)
+                    final_website_url = page.url
 
                     # Get title
                     try:
@@ -471,6 +563,7 @@ class EnrichmentService:
 
         return {
             "company": company,
+            "website": final_website_url,
             "emails": list(emails),
             "phones": list(phones),
             "whatsapp_numbers": list(whatsapp_numbers),
@@ -507,38 +600,35 @@ class EnrichmentService:
             if not email_lower.endswith(ignored_email_extensions):
                 results["emails"].add(email)
 
-        # Extract phones using Google's PhoneNumberMatcher
-        try:
-            for match in phonenumbers.PhoneNumberMatcher(text, default_region):
-                cleaned = clean_phone(match.raw_string, default_region)
-                if cleaned and is_valid_phone_number(match.raw_string, cleaned, default_region):
-                    results["phones"].add(cleaned)
-        except Exception as e:
-            logger.warning("phonenumbers_matcher_failed", error=str(e))
-            # Fallback to regex
-            phone_matches = PHONE_PATTERN.findall(text)
-            for match in phone_matches:
-                if isinstance(match, tuple):
-                    match = match[0] if match[0] else match[1]
-                if match:
-                    cleaned = clean_phone(match, default_region)
-                    if is_valid_phone_number(match, cleaned, default_region):
-                        results["phones"].add(cleaned)
+        # Extract tel links (href="tel:..." or general tel: prefix)
+        tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', html, re.I)
+        # Fallback to general tel: matching
+        tel_matches.extend(re.findall(r'tel:([\d+\-\s()]+)', html, re.I))
 
-        # Extract tel links
-        tel_matches = re.findall(r'tel:([\d+\-\s()]+)', html, re.I)
-        for tel in tel_matches:
+        # Extract phone numbers from WhatsApp link hrefs (phone parameters)
+        wa_phone_matches = re.findall(r'wa\.me/(\d+)|whatsapp\.com/send\?phone=(\d+)', html, re.I)
+        for match in wa_phone_matches:
+            num = match[0] if match[0] else match[1]
+            if num:
+                tel_matches.append(num)
+
+        # Extract phone numbers from anchor tag text contents (e.g., <a ...>+91 8940833985</a>)
+        anchor_texts = re.findall(r'<a\b[^>]*>([\s\S]*?)</a>', html, re.I)
+        for text_content in anchor_texts:
+            # Clean HTML tags inside the anchor text if any (e.g. span, strong)
+            clean_text = re.sub(r'<[^>]*>', '', text_content).strip()
+            # If the clean text contains 6 to 15 digits, we add it to candidates
+            digits_only = re.sub(r'\D', '', clean_text)
+            if 6 <= len(digits_only) <= 15:
+                tel_matches.append(clean_text)
+        
+        for tel in set(tel_matches):
             cleaned = clean_phone(tel, default_region)
             if is_valid_phone_number(tel, cleaned, default_region):
                 results["phones"].add(cleaned)
 
         # Extract WhatsApp
-        whatsapp_matches = re.findall(
-            r'wa\.me/(\d+)|whatsapp\.com/send\?phone=(\d+)',
-            html,
-            re.I
-        )
-        for match in whatsapp_matches:
+        for match in wa_phone_matches:
             num = match[0] if match[0] else match[1]
             if num:
                 cleaned = clean_phone(num, default_region)

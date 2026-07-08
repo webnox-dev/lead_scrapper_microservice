@@ -355,6 +355,7 @@ class PipelineManager:
                 biz["website"] = col.website
                 biz["rating"] = col.rating
                 biz["review_count"] = col.review_count
+                biz["keyword"] = col.keyword
                 await queue.put(biz)
 
             # Run discovery for all keyword/area combinations
@@ -479,6 +480,7 @@ class PipelineManager:
                 col_id = uuid4()
                 biz["collection_id"] = str(col_id)
                 biz["area"] = area
+                biz["keyword"] = keyword
 
                 async with db_lock:
                     pending.append(Collection(
@@ -594,7 +596,8 @@ class PipelineManager:
                     job_id=job_id,
                     collection_id=UUID(biz["collection_id"]) if biz.get("collection_id") else None,
                     company_name=biz["name"],
-                    website=website,
+                    niche=biz.get("keyword"),
+                    website=result.get("website", website) if result else website,
                     address=biz.get("address"),
                     emails=result.get("emails", []) if result else [],
                     phones=result.get("phones", []) if result else fallback_phone,
