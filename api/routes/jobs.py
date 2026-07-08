@@ -30,6 +30,7 @@ async def create_job(
     job = Job(
         id=job_id,
         name=job_data.name,
+        niche=job_data.niche,
         status=JobStatus.PENDING.value,
         keywords=job_data.keywords,
         areas=job_data.areas,
@@ -56,6 +57,7 @@ async def create_job(
     return {
         "id": job.id,
         "name": job.name,
+        "niche": job.niche,
         "status": job.status,
         "keywords": job.keywords,
         "areas": job.areas,
@@ -77,10 +79,90 @@ async def create_job(
     }
 
 
+@router.get("/niches", response_model=list)
+async def list_niches(db: DbSession) -> list:
+    """List all unique niches (keywords) with stats."""
+    result = await db.execute(select(Job))
+    jobs = result.scalars().all()
+    
+    niche_stats = {}
+    for job in jobs:
+        # Determine niche name (use direct niche column, fallback to keywords)
+        niche_names = []
+        if job.niche:
+            niche_names = [job.niche]
+        elif job.keywords:
+            niche_names = job.keywords
+            
+        for kw in niche_names:
+            kw_clean = kw.strip().lower() if kw else ""
+            if not kw_clean:
+                continue
+            if kw_clean not in niche_stats:
+                niche_stats[kw_clean] = {
+                    "name": kw.strip(),
+                    "job_count": 0,
+                    "lead_count": 0,
+                }
+            niche_stats[kw_clean]["job_count"] += 1
+            niche_stats[kw_clean]["lead_count"] += job.total_leads_enriched
+            
+    return sorted(list(niche_stats.values()), key=lambda x: x["name"].lower())
+
+
+@router.delete("/niches/{niche_name}", response_model=dict)
+async def delete_niche(niche_name: str, db: DbSession) -> dict:
+    """Delete all jobs and their leads for a given niche topic."""
+    from sqlalchemy import Text
+    from db.models.lead import Lead
+
+    # Find all jobs belonging to this niche
+    result = await db.execute(
+        select(Job).where(
+            (func.lower(Job.niche) == niche_name.lower()) |
+            ((Job.niche == None) & func.lower(Job.keywords.cast(Text)).like(f'%"{niche_name.lower()}"%'))
+        )
+    )
+    jobs = result.scalars().all()
+    job_ids = [job.id for job in jobs]
+
+    deleted_leads = 0
+    deleted_jobs = len(job_ids)
+
+    if job_ids:
+        # Delete all leads for these jobs
+        lead_result = await db.execute(
+            select(Lead).where(Lead.job_id.in_(job_ids))
+        )
+        leads = lead_result.scalars().all()
+        deleted_leads = len(leads)
+        for lead in leads:
+            await db.delete(lead)
+
+        # Delete all collections for these jobs
+        from db.models.collection import Collection
+        col_result = await db.execute(
+            select(Collection).where(Collection.job_id.in_(job_ids))
+        )
+        cols = col_result.scalars().all()
+        for col in cols:
+            await db.delete(col)
+
+        # Delete the jobs themselves
+        for job in jobs:
+            await db.delete(job)
+
+        await db.commit()
+
+    logger.info("niche_deleted", niche=niche_name, jobs=deleted_jobs, leads=deleted_leads)
+    return {"deleted_jobs": deleted_jobs, "deleted_leads": deleted_leads}
+
+
 @router.get("", response_model=dict)
 async def list_jobs(
     db: DbSession,
     status_filter: str | None = Query(None, alias="status"),
+    niche: str | None = Query(None),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -91,6 +173,17 @@ async def list_jobs(
     if status_filter:
         query = query.where(Job.status == status_filter)
         count_query = count_query.where(Job.status == status_filter)
+
+    if niche:
+        from sqlalchemy import Text
+        query = query.where(
+            (func.lower(Job.niche) == niche.lower()) |
+            ((Job.niche == None) & func.lower(Job.keywords.cast(Text)).like(f'%"{niche.lower()}"%'))
+        )
+        count_query = count_query.where(
+            (func.lower(Job.niche) == niche.lower()) |
+            ((Job.niche == None) & func.lower(Job.keywords.cast(Text)).like(f'%"{niche.lower()}"%'))
+        )
 
     query = query.order_by(desc(Job.created_at)).offset(offset).limit(limit)
 
@@ -109,6 +202,7 @@ async def list_jobs(
         jobs_data.append({
             "id": job.id,
             "name": job.name,
+            "niche": job.niche,
             "status": job.status,
             "keywords": job.keywords,
             "areas": job.areas,

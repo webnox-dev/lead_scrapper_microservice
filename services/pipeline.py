@@ -346,6 +346,11 @@ class PipelineManager:
                 for i in range(num_workers)
             ]
 
+            # Get job niche
+            async with AsyncSessionLocal() as db:
+                job_obj = await db.get(Job, job_id)
+                job_niche = job_obj.niche if job_obj else None
+
             # Push unenriched existing collections to queue so they get enriched
             for col in unenriched_collections:
                 biz = col.raw_data or {}
@@ -356,6 +361,7 @@ class PipelineManager:
                 biz["rating"] = col.rating
                 biz["review_count"] = col.review_count
                 biz["keyword"] = col.keyword
+                biz["niche"] = job_niche
                 await queue.put(biz)
 
             # Run discovery for all keyword/area combinations
@@ -369,6 +375,7 @@ class PipelineManager:
                         job_id=job_id,
                         keyword=keyword,
                         area=area,
+                        niche=job_niche,
                         max_results=max_results,
                         seen_urls=self.seen_maps_urls.get(job_id, set()),
                         queue=queue,
@@ -424,6 +431,7 @@ class PipelineManager:
         job_id: UUID,
         keyword: str,
         area: str,
+        niche: str | None,
         max_results: int,
         seen_urls: set[str],
         queue: asyncio.Queue,
@@ -481,6 +489,7 @@ class PipelineManager:
                 biz["collection_id"] = str(col_id)
                 biz["area"] = area
                 biz["keyword"] = keyword
+                biz["niche"] = niche
 
                 async with db_lock:
                     pending.append(Collection(
@@ -596,7 +605,7 @@ class PipelineManager:
                     job_id=job_id,
                     collection_id=UUID(biz["collection_id"]) if biz.get("collection_id") else None,
                     company_name=biz["name"],
-                    niche=biz.get("keyword"),
+                    niche=biz.get("niche") or biz.get("keyword"),
                     website=result.get("website", website) if result else website,
                     address=biz.get("address"),
                     emails=result.get("emails", []) if result else [],

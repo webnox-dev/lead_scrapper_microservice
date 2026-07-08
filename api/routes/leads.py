@@ -189,6 +189,7 @@ from fastapi import Query
 async def list_leads(
     db: DbSession,
     job_id: str | None = Query(None),
+    niche: str | None = Query(None),
     limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0),
 ) -> dict:
@@ -203,6 +204,17 @@ async def list_leads(
             count_query = count_query.where(Lead.job_id == job_uuid)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid job_id UUID")
+
+    if niche:
+        from db.models.collection import Collection
+        query = query.outerjoin(Collection).where(
+            (func.lower(Lead.niche) == niche.lower()) |
+            (func.lower(Collection.keyword) == niche.lower())
+        )
+        count_query = count_query.outerjoin(Collection).where(
+            (func.lower(Lead.niche) == niche.lower()) |
+            (func.lower(Collection.keyword) == niche.lower())
+        )
 
     # Order by company name
     query = query.order_by(Lead.company_name).offset(offset).limit(limit).options(selectinload(Lead.collection))

@@ -44,6 +44,7 @@ class Job(Base):
     )
     
     # Search parameters
+    niche: Mapped[str | None] = mapped_column(String(255), nullable=True)
     keywords: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     areas: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     max_results: Mapped[int] = mapped_column(Integer, default=50)

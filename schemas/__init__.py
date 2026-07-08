@@ -11,6 +11,7 @@ class JobCreate(BaseModel):
     """Job creation schema."""
 
     name: str = Field(default="", min_length=1, max_length=255)
+    niche: str | None = Field(default=None, max_length=255)
     keywords: list[str] = Field(default_factory=list)
     areas: list[str] = Field(default_factory=list)
     max_results: int = Field(default=50, ge=1, le=10000)
