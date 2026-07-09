@@ -175,8 +175,13 @@ class BrowserManager:
 
     async def _create_context(self, context_id: str) -> BrowserContext:
         """Create a new browser context."""
-        if not self._browser:
+        # With launch_persistent_context, self._browser is None but the default context exists
+        if not self._browser and "default" not in self._contexts:
             raise RuntimeError("Browser not started")
+        
+        # If we used launch_persistent_context, reuse that context for new pages
+        if not self._browser and "default" in self._contexts:
+            return self._contexts["default"]
 
         context = await self._browser.new_context(
             user_agent=(
@@ -680,15 +685,18 @@ class BrowserManager:
         self,
         website: str,
     ) -> AsyncGenerator[Page, None]:
-        """Get a page for website scraping with isolated context."""
-        context_id = f"website_{hash(website) % 10000}"
-
+        """Get a page for website scraping.
+        
+        Reuses the persistent default context (created by launch_persistent_context)
+        for all website scraping tasks, since isolated contexts require self._browser
+        which is not available when using the persistent context approach.
+        """
         async with self._semaphore:
-            # Create isolated context for this website
-            if context_id not in self._contexts:
-                self._contexts[context_id] = await self._create_context(context_id)
+            # Always use the persistent default context for website scraping
+            if "default" not in self._contexts:
+                raise RuntimeError("Browser not started — call browser.start() first")
 
-            context = self._contexts[context_id]
+            context = self._contexts["default"]
             page = await context.new_page()
 
             try:

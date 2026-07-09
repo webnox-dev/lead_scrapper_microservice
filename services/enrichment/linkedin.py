@@ -157,17 +157,31 @@ async def fetch_company_details_playwright(url: str) -> dict[str, Any]:
                         }
                     }
                     
-                    // 3. Extract Followers count
-                    const text = document.body.innerText;
-                    const followersMatch = text.match(/([\\d,]+)\\s+followers/i);
+                    // 3. Extract Followers count - try body text and meta description
+                    const bodyText = document.body.innerText || "";
+                    const metaDesc = document.querySelector('meta[name="description"]')?.content || "";
+                    const allText = bodyText + " " + metaDesc;
+
+                    const followersMatch = allText.match(/([\\d,]+)\\s+followers/i);
                     if (followersMatch) {
                         data.followers = followersMatch[1];
                     }
                     
-                    // 4. Extract Employee count
-                    const employeesMatch = text.match(/all\\s+(\\d+)\\s+employees/i);
-                    if (employeesMatch) {
-                        data.employees_on_linkedin = parseInt(employeesMatch[1]);
+                    // 4. Extract Employee count - try multiple patterns
+                    const empMatch = allText.match(/see all\\s+(\\d[\\d,]*)\\s+employees/i)
+                        || allText.match(/(\\d[\\d,]*)\\s+employees on linkedin/i)
+                        || allText.match(/(\\d[\\d,]*)\\s+employees/i);
+                    if (empMatch) {
+                        data.employees_on_linkedin = parseInt(empMatch[1].replace(/,/g, ''));
+                    }
+
+                    // 5. Extract Founded year from dt/dd already handled above,
+                    //    but also try text pattern as fallback
+                    if (!data.founded) {
+                        const foundedMatch = allText.match(/founded[:\\s]+(\\d{4})/i)
+                            || allText.match(/established in (\\d{4})/i)
+                            || allText.match(/since (\\d{4})/i);
+                        if (foundedMatch) data.founded = foundedMatch[1];
                     }
                     
                     return data;
@@ -310,7 +324,11 @@ async def verify_linkedin_profile(
                     comp = re.sub(r"\s*\|\s*linkedin", "", comp, flags=re.I).strip()
                     result["company"] = comp
                     
-                logger.info("linkedin_verification_success", url=url, name=result["name"])
+                try:
+                    safe_name = result["name"].encode("ascii", errors="replace").decode("ascii")
+                    logger.info("linkedin_verification_success", url=url, name=safe_name)
+                except Exception:
+                    pass
                 return result
                 
             elif "linkedin.com/company/" in url and method == "COMPANY":

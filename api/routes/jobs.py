@@ -158,6 +158,32 @@ async def delete_niche(niche_name: str, db: DbSession) -> dict:
     return {"deleted_jobs": deleted_jobs, "deleted_leads": deleted_leads}
 
 
+@router.put("/niches/{niche_name}", response_model=dict)
+async def rename_niche(niche_name: str, new_name: str = Query(..., min_length=1), db: DbSession = None) -> dict:
+    """Rename a niche topic in all jobs and leads."""
+    from db.models.lead import Lead
+
+    # 1. Update jobs
+    result = await db.execute(
+        select(Job).where(func.lower(Job.niche) == niche_name.lower())
+    )
+    jobs = result.scalars().all()
+    for job in jobs:
+        job.niche = new_name
+
+    # 2. Update leads
+    lead_result = await db.execute(
+        select(Lead).where(func.lower(Lead.niche) == niche_name.lower())
+    )
+    leads = lead_result.scalars().all()
+    for lead in leads:
+        lead.niche = new_name
+
+    await db.commit()
+    logger.info("niche_renamed", old_name=niche_name, new_name=new_name, jobs=len(jobs), leads=len(leads))
+    return {"jobs_updated": len(jobs), "leads_updated": len(leads)}
+
+
 @router.get("", response_model=dict)
 async def list_jobs(
     db: DbSession,

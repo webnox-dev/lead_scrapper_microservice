@@ -149,6 +149,7 @@ class EnrichmentService:
         website: str,
         name_hint: str = "",
         default_region: str = "IN",
+        search_keyword: str = "",
     ) -> dict[str, Any] | None:
         """Enrich a single website — extract contacts.
 
@@ -156,6 +157,7 @@ class EnrichmentService:
             website: The website URL to scrape.
             name_hint: Business name hint for fallback.
             default_region: Detected country code.
+            search_keyword: The search query used to find the business.
 
         Returns:
             Dict with emails, phones, social_links, etc. or None if failed.
@@ -217,7 +219,7 @@ class EnrichmentService:
                         cached_data["verification"]["phones"] = filtered_v_details
 
                         logger.info("enrichment_cache_hit", website=website, lead_id=str(existing_lead.id))
-                        print(f"⚡ Cache Hit: {website} (Reusing contacts)")
+                        print(f"Cache Hit: {website} (Reusing contacts)")
                         return {
                             "company": existing_lead.company_name or name_hint,
                             "website": existing_lead.website or website,
@@ -232,12 +234,12 @@ class EnrichmentService:
                         }
                     else:
                         logger.info("enrichment_cache_ignored_no_verification_or_advanced_details", website=website)
-                        print(f"⚡ Cache Ignored (No advanced verification data): {website}")
+                        print(f"Cache Ignored (No advanced verification data): {website}")
             except Exception as e:
                 logger.warning("enrichment_cache_lookup_failed", website=website, error=str(e))
 
-        print(f"🌐 Scraping: {website}")
-        result = await self._scrape_website(website, name_hint, default_region)
+        print(f"Scraping: {website}")
+        result = await self._scrape_website(website, name_hint, default_region, search_keyword)
 
         if result:
             raw_emails = result.get("emails", [])
@@ -249,7 +251,7 @@ class EnrichmentService:
 
             emails = result.get("emails", [])
             phones = result.get("phones", [])
-            print(f"✅ {name_hint or website}: {len(emails)} emails (verified), {len(phones)} phones")
+            print(f"Success: {name_hint or website}: {len(emails)} emails (verified), {len(phones)} phones")
 
             # --- Verification Phase ---
             # 1. Verify Phone Numbers
@@ -261,15 +263,16 @@ class EnrichmentService:
                 if v_res["valid"]:
                     valid_phones.append(v_res["cleaned"])
             
-            # Fallback check if the main place record has a phone that wasn't verified
-            if not valid_phones and result.get("phone"):
+            # Always verify and include the main listing phone if available
+            if result.get("phone"):
                 v_res = verify_phone(result["phone"], default_region)
-                verified_phones_details.append(v_res)
-                if v_res["valid"]:
+                # Avoid duplicates in verified details
+                if not any(d.get("cleaned") == v_res["cleaned"] for d in verified_phones_details):
+                    verified_phones_details.append(v_res)
+                if v_res["valid"] and v_res["cleaned"] not in valid_phones:
                     valid_phones.append(v_res["cleaned"])
 
-            if valid_phones:
-                result["phones"] = list(set(valid_phones))
+            result["phones"] = list(set(valid_phones))
 
             # 2. LinkedIn Profile Verification (via DuckDuckGo)
             linkedin_details = {
@@ -300,12 +303,15 @@ class EnrichmentService:
                 result["social_links"] = social_links
 
             # Save verification metadata
+            if result.get("founded_year") and not linkedin_details.get("founded"):
+                linkedin_details["founded"] = result["founded_year"]
+
             result["verification"] = {
                 "phones": verified_phones_details,
                 "linkedin": linkedin_details,
             }
         else:
-            print(f"❌ {name_hint or website}: no contacts found")
+            print(f"Failed: {name_hint or website}: no contacts found")
 
         return result
 
@@ -314,6 +320,7 @@ class EnrichmentService:
         website: str,
         name_hint: str,
         default_region: str = "IN",
+        search_keyword: str = "",
     ) -> dict[str, Any] | None:
         """Attempt to scrape the website using fast HTTP requests first."""
         logger.info("httpx_enrichment_attempt", website=website)
@@ -361,6 +368,7 @@ class EnrichmentService:
 
                 text = re.sub(r'<[^>]+>', ' ', html)
                 contacts = self._extract_contacts(text, html, default_region)
+                founded_year = self._extract_founded_year(text)
                 
                 emails.update(contacts["emails"])
                 phones.update(contacts["phones"])
@@ -369,16 +377,33 @@ class EnrichmentService:
                 social_links.update(contacts["social_links"])
                 pages_crawled = 1
 
-                links = self._find_contact_links(html, website)
+                # Get homepage links & sitemap links
+                links = self._find_contact_links(html, website, search_keyword)
+                sitemap_links = await self._get_sitemap_links(website)
+
+                # Merge links, removing duplicates
+                all_links_set = set(links)
+                for link in sitemap_links:
+                    all_links_set.add(link)
+
+                # Recalculate priority scores for the merged set
+                scored_links = []
+                for link in all_links_set:
+                    priority = self._get_page_priority(link, search_keyword)
+                    scored_links.append((priority, link))
+
+                # Sort by priority
+                scored_links.sort(key=lambda x: -x[0])
+                sorted_links = [url for _, url in scored_links]
+
                 max_pages = settings.max_pages_per_site
 
                 visited = {website}
-                for url in links[:max_pages - 1]:
-                    if url in visited or pages_crawled >= max_pages:
-                        continue
-
-                    if len(emails) >= 3 and len(phones) >= 3:
+                for url in sorted_links:
+                    if pages_crawled >= max_pages:
                         break
+                    if url in visited:
+                        continue
 
                     try:
                         p_resp = await client.get(url)
@@ -390,6 +415,9 @@ class EnrichmentService:
                             p_html = p_resp.text
                             p_text = re.sub(r'<[^>]+>', ' ', p_html)
                             p_contacts = self._extract_contacts(p_text, p_html, default_region)
+
+                            if not founded_year:
+                                founded_year = self._extract_founded_year(p_text)
 
                             if p_contacts["emails"] or p_contacts["phones"] or p_contacts["social_links"]:
                                 contact_pages.append(url)
@@ -423,6 +451,7 @@ class EnrichmentService:
             "social_links": list(social_links),
             "contact_pages": contact_pages,
             "pages_crawled": pages_crawled,
+            "founded_year": founded_year,
         }
 
     async def _scrape_website(
@@ -430,6 +459,7 @@ class EnrichmentService:
         website: str,
         name_hint: str,
         default_region: str = "IN",
+        search_keyword: str = "",
     ) -> dict[str, Any] | None:
         """Scrape website for contact information."""
         # Try HTTPX first
@@ -447,10 +477,15 @@ class EnrichmentService:
 
             for url in urls_to_try:
                 try:
-                    result = await self._scrape_website_httpx(url, name_hint, default_region)
+                    result = await self._scrape_website_httpx(url, name_hint, default_region, search_keyword)
                     if result:
-                        logger.info("enrichment_httpx_success", website=url)
-                        return result
+                        has_emails = len(result.get("emails", [])) > 0
+                        has_valid_phones = any(verify_phone(p, default_region)["valid"] for p in result.get("phones", []))
+                        if has_emails or has_valid_phones:
+                            logger.info("enrichment_httpx_success", website=url)
+                            return result
+                        else:
+                            logger.info("enrichment_httpx_empty_contacts_falling_back", website=url)
                 except Exception as e:
                     logger.debug("enrichment_httpx_attempt_failed", url=url, error=str(e))
                     continue
@@ -467,6 +502,7 @@ class EnrichmentService:
         social_links: set[str] = set()
         contact_pages: list[str] = []
         pages_crawled = 0
+        founded_year = None
 
         final_website_url = website
         parsed = urlparse(website)
@@ -502,6 +538,8 @@ class EnrichmentService:
                     text = await page.evaluate("() => document.body?.innerText || ''")
 
                     contacts = self._extract_contacts(text, html, default_region)
+                    founded_year = self._extract_founded_year(text)
+
                     emails.update(contacts["emails"])
                     phones.update(contacts["phones"])
                     whatsapp_numbers.update(contacts["whatsapp"])
@@ -509,20 +547,34 @@ class EnrichmentService:
                     social_links.update(contacts["social_links"])
                     pages_crawled = 1
 
-                    # Find contact links
-                    links = self._find_contact_links(html, url)
+                    # Get homepage links & sitemap links
+                    links = self._find_contact_links(html, url, search_keyword)
+                    sitemap_links = await self._get_sitemap_links(url)
+
+                    # Merge links, removing duplicates
+                    all_links_set = set(links)
+                    for link in sitemap_links:
+                        all_links_set.add(link)
+
+                    # Recalculate priority scores for the merged set
+                    scored_links = []
+                    for link in all_links_set:
+                        priority = self._get_page_priority(link, search_keyword)
+                        scored_links.append((priority, link))
+
+                    # Sort by priority
+                    scored_links.sort(key=lambda x: -x[0])
+                    sorted_links = [p_url for _, p_url in scored_links]
 
                     # Crawl high-value pages
                     visited = {url}
                     max_pages = settings.max_pages_per_site
 
-                    for page_url in links[:max_pages - 1]:
-                        if page_url in visited or pages_crawled >= max_pages:
-                            continue
-
-                        # Skip if we have enough contacts
-                        if len(emails) >= 3 and len(phones) >= 3:
+                    for page_url in sorted_links:
+                        if pages_crawled >= max_pages:
                             break
+                        if page_url in visited:
+                            continue
 
                         try:
                             await page.goto(page_url, timeout=15000, wait_until="domcontentloaded")
@@ -532,6 +584,9 @@ class EnrichmentService:
                             text = await page.evaluate("() => document.body?.innerText || ''")
 
                             page_contacts = self._extract_contacts(text, html, default_region)
+
+                            if not founded_year:
+                                founded_year = self._extract_founded_year(text)
 
                             if page_contacts["emails"] or page_contacts["phones"] or page_contacts["social_links"]:
                                 contact_pages.append(page_url)
@@ -571,7 +626,22 @@ class EnrichmentService:
             "social_links": list(social_links),
             "contact_pages": contact_pages,
             "pages_crawled": pages_crawled,
+            "founded_year": founded_year,
         }
+
+    def _extract_founded_year(self, text: str) -> str | None:
+        """Extract founded/established year from text."""
+        if not text:
+            return None
+        # Look for "established in 2011", "founded in 2011", "since 2011", "est. 2011"
+        match = re.search(r'\b(?:established|founded|started|since|incorporated|est\.)\b.{1,20}\b(18\d\d|19\d\d|20[0-2]\d)\b', text, re.I)
+        if match:
+            return match.group(1)
+        # Fallback to year near keywords
+        match = re.search(r'\b(18\d\d|19\d\d|20[0-2]\d)\b.{1,20}\b(?:established|founded|est\.)\b', text, re.I)
+        if match:
+            return match.group(1)
+        return None
 
     def _extract_contacts(self, text: str, html: str, default_region: str = "IN") -> dict[str, Any]:
         """Extract contact information from text and HTML using phonenumbers."""
@@ -622,6 +692,20 @@ class EnrichmentService:
             if 6 <= len(digits_only) <= 15:
                 tel_matches.append(clean_text)
         
+        # Extract phone numbers from body text using PHONE_PATTERN
+        text_matches = PHONE_PATTERN.findall(text)
+        for match in text_matches:
+            if match:
+                tel_matches.append(match)
+
+        # Extract phone numbers from body text using Google's phonenumbers library Matcher
+        try:
+            for match in phonenumbers.PhoneNumberMatcher(text, default_region):
+                formatted = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.E164)
+                tel_matches.append(formatted)
+        except Exception:
+            pass
+        
         for tel in set(tel_matches):
             cleaned = clean_phone(tel, default_region)
             if is_valid_phone_number(tel, cleaned, default_region):
@@ -645,7 +729,7 @@ class EnrichmentService:
 
         return results
 
-    def _find_contact_links(self, html: str, base_url: str) -> list[str]:
+    def _find_contact_links(self, html: str, base_url: str, search_keyword: str = "") -> list[str]:
         """Find contact-related links."""
         links = []
         parsed_base = urlparse(base_url)
@@ -683,12 +767,11 @@ class EnrichmentService:
             parsed_link = urlparse(full_url)
             link_domain = parsed_link.netloc
             link_domain_clean = link_domain[4:] if link_domain.startswith("www.") else link_domain
-
             if base_domain_clean != link_domain_clean:
                 continue
 
-            # Prioritize high-value pages
-            priority = 2 if self._is_high_value_page(full_url) else 1
+            # Prioritize pages
+            priority = self._get_page_priority(full_url, search_keyword)
 
             if full_url not in seen:
                 seen.add(full_url)
@@ -698,7 +781,93 @@ class EnrichmentService:
         links.sort(key=lambda x: -x[0])
         return [url for _, url in links]
 
-    def _is_high_value_page(self, url: str) -> bool:
-        """Check if URL is a high-value contact page."""
+    def _get_page_priority(self, url: str, search_keyword: str = "") -> int:
+        """Get crawl priority for a URL:
+        - 3: High-value contact/about/support pages (Highest priority)
+        - 2: Keyword-matching campaign pages (Medium priority)
+        - 1: Standard pages (Normal priority)
+        """
         url_lower = url.lower()
-        return any(keyword in url_lower for keyword in HIGH_VALUE_PAGES)
+        
+        # Priority 3: Contact, About, Support, enquiry, locations, careers, legal, refund & faq pages
+        contact_keywords = [
+            "contact", "contact-us", "contactus", "about", "about-us", "aboutus",
+            "support", "get-in-touch", "reach-us", "offices", "branches", "locations",
+            "enquiry", "enquire", "feedback", "get-quote", "quote", "careers", "jobs",
+            "team", "our-team", "ourteam", "find-us", "findus", "help", "helpdesk", "info",
+            "privacy", "privacy-policy", "terms", "terms-of-service", "legal",
+            "refund", "return", "returns", "cancellation", "faq", "faqs", "help-center",
+            "helpcenter", "headquarters", "hq", "work-with-us", "join-us", "recruitment"
+        ]
+        if any(kw in url_lower for kw in contact_keywords):
+            return 3
+
+        if search_keyword:
+            # Split search keyword into lowercase words of length 3+
+            words = [w.strip().lower() for w in re.split(r'\s+|-|_', search_keyword) if len(w.strip()) >= 3]
+            parsed = urlparse(url)
+            path_lower = parsed.path.lower()
+            if any(word in path_lower for word in words):
+                return 2
+
+        return 1
+
+    async def _get_sitemap_links(self, base_url: str) -> list[str]:
+        """Fetch and parse sitemap.xml or sitemap_index.xml for URLs."""
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        sitemap_urls = [
+            f"{parsed.scheme}://{parsed.netloc}/sitemap.xml",
+            f"{parsed.scheme}://{parsed.netloc}/sitemap_index.xml",
+        ]
+
+        extracted_links = []
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+
+        # Ignore common static asset extensions to prevent unnecessary crawls and regex hangs
+        ignored_extensions = (
+            '.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.pdf', 
+            '.zip', '.tar', '.gz', '.woff', '.woff2', '.ttf', '.eot', '.ico', 
+            '.mp4', '.avi', '.mov', '.mp3', '.wav', '.xml', '.json', '.txt',
+            '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.map'
+        )
+
+        base_domain = parsed.netloc
+        base_domain_clean = base_domain[4:] if base_domain.startswith("www.") else base_domain
+
+        import httpx
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=10.0) as client:
+            for sitemap_url in sitemap_urls:
+                try:
+                    resp = await client.get(sitemap_url)
+                    if resp.status_code == 200:
+                        # Extract all links inside <loc>...</loc> tags
+                        links = re.findall(r"<loc>(.*?)</loc>", resp.text, re.I)
+                        for link in links:
+                            link_clean = link.strip()
+                            if link_clean.startswith("http"):
+                                parsed_link = urlparse(link_clean)
+                                link_domain = parsed_link.netloc
+                                link_domain_clean = link_domain[4:] if link_domain.startswith("www.") else link_domain
+
+                                # Filter same domain
+                                if base_domain_clean != link_domain_clean:
+                                    continue
+
+                                # Filter ignored extensions
+                                if parsed_link.path.lower().endswith(ignored_extensions):
+                                    continue
+
+                                extracted_links.append(link_clean)
+                        # If we found links, we don't need to try the other sitemap URL
+                        if extracted_links:
+                            break
+                except Exception:
+                    continue
+        return list(set(extracted_links))

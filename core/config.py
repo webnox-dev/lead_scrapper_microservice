@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     search_concurrency: int = 3
     business_concurrency: int = 5
     max_retries: int = 3
-    max_pages_per_site: int = 8
+    max_pages_per_site: int = 15
     
     @computed_field
     @property

@@ -568,6 +568,7 @@ class PipelineManager:
                                 website=website,
                                 name_hint=biz["name"],
                                 default_region=country_iso,
+                                search_keyword=biz.get("keyword", ""),
                             ),
                             timeout=45.0
                         )
