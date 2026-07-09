@@ -1,5 +1,6 @@
 """LinkedIn verification service using Yahoo and DuckDuckGo search."""
 
+import asyncio
 import re
 import urllib.parse
 from typing import Any
@@ -51,9 +52,9 @@ def extract_name_from_email(email: str) -> str | None:
     return " ".join(parts)
 
 
-async def search_yahoo_playwright(query: str) -> list[dict[str, str]]:
+async def search_yahoo_playwright(query: str, offset: int = 1) -> list[dict[str, str]]:
     """Fetch search results from Yahoo using Playwright (no captcha wall)."""
-    url = f"https://search.yahoo.com/search?q={urllib.parse.quote(query)}"
+    url = f"https://search.yahoo.com/search?q={urllib.parse.quote(query)}&b={offset}"
     browser = get_browser_manager()
     
     try:
@@ -197,12 +198,32 @@ async def fetch_company_details_playwright(url: str) -> dict[str, Any]:
 async def search_company_employees(company_name: str) -> list[dict[str, str]]:
     """Search for employees/people working at the company using Yahoo search."""
     query = f'site:linkedin.com/in "{company_name}"'
-    search_results = await search_yahoo_playwright(query)
     
+    # Fetch up to 5 pages of Yahoo search results to find as many actual employees as possible
+    raw_results = []
+    for p_idx in range(5):
+        offset = p_idx * 10 + 1
+        page_results = await search_yahoo_playwright(query, offset=offset)
+        if not page_results:
+            break
+        # Deduplicate
+        for item in page_results:
+            if not any(r["url"] == item["url"] for r in raw_results):
+                raw_results.append(item)
+                
+        # Pause slightly between pages to avoid throttling
+        await asyncio.sleep(0.5)
+
     employees = []
-    for item in search_results[:5]:  # Limit to top 5 employees
+    # Identify key words of the company name to perform soft matching if needed
+    comp_clean = company_name.lower().strip()
+    # Filter out common legal words or generic words
+    comp_words = [w for w in re.findall(r'\w+', comp_clean) if w not in ("pvt", "ltd", "gmbh", "co", "corp", "corporation", "inc", "incorporated", "llc", "company", "limited")]
+    
+    for item in raw_results:
         url = item["url"]
         title = item["title"]
+        snippet = item["snippet"]
         
         # Clean title
         title_lines = [line.strip() for line in title.split("\n") if line.strip()]
@@ -220,12 +241,65 @@ async def search_company_employees(company_name: str) -> list[dict[str, str]]:
             if len(parts) > 1:
                 role = " - ".join(parts[1:])
                 role = re.sub(r"\s*\|\s*linkedin", "", role, flags=re.I).strip()
-                
-        employees.append({
-            "name": name,
-            "role": role,
-            "url": url,
-        })
+
+        # Check if they actually work at the company
+        # 1. Skip if the person's name matches the company name exactly (it's a company page or index, not a person)
+        if name.lower().strip() == comp_clean:
+            continue
+            
+        # 2. Check if the company name or its key words appear in the role headline or search snippet
+        role_lower = role.lower()
+        snippet_lower = snippet.lower()
+        
+        # Verify that all significant company name words are present in either the role or snippet
+        is_employee = False
+        if comp_clean in role_lower or comp_clean in snippet_lower:
+            is_employee = True
+        elif comp_words:
+            # Check if at least one unique/specific word is present (like 'Appac')
+            # For short/common words, require exact word boundary to prevent false positives (e.g. matching 'media' globally)
+            for word in comp_words:
+                if len(word) > 4 and (word in role_lower or word in snippet_lower):
+                    is_employee = True
+                    break
+                elif len(word) <= 4:
+                    # Require word boundary for short words
+                    pattern = r'\b' + re.escape(word) + r'\b'
+                    if re.search(pattern, role_lower) or re.search(pattern, snippet_lower):
+                        # But skip if it's just 'media' or 'tech' and it's too generic, unless combined
+                        if word in ("media", "tech", "web", "seo", "ad", "ads"):
+                            # Check if other keywords are also present
+                            other_words = [w for w in comp_words if w != word]
+                            if any(ow in role_lower or ow in snippet_lower for ow in other_words):
+                                is_employee = True
+                                break
+                        else:
+                            is_employee = True
+                            break
+                            
+        if is_employee:
+            role_lower = role.lower().strip()
+            # Exclude non-employees (students, alumni, interns, former employees)
+            exclude_keywords = [
+                "student", "alumni", "alumnus", "studying", "candidate", "graduate", 
+                "pupil", "course", "batch", "learning", "education", "class", 
+                "certified", "trainee", "intern", "ex-", "ex ", "former", "retired"
+            ]
+            if any(kw in role_lower for kw in exclude_keywords):
+                continue
+
+            # Exclude if role is just the company name itself (no job title specified)
+            clean_role_check = re.sub(r"\b(?:linkedin|member)\b.*", "", role_lower, flags=re.I).strip()
+            clean_role_check = re.sub(r"[\s\-\|›\u00a0\u2010-\u2015]+$", "", clean_role_check).strip()
+            if clean_role_check == comp_clean:
+                continue
+
+            employees.append({
+                "name": name,
+                "role": role,
+                "url": url,
+            })
+            
     return employees
 
 

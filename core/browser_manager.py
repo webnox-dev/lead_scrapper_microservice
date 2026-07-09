@@ -70,7 +70,7 @@ class BrowserManager:
                 chrome_path = shutil.which("google-chrome") or shutil.which("chromium-browser") or shutil.which("chromium")
                 
                 # Ensure the user data profile directory exists
-                user_data_dir = "./user_profile"
+                user_data_dir = os.getenv("PLAYWRIGHT_USER_DATA_DIR", "./user_profile")
                 os.makedirs(user_data_dir, exist_ok=True)
                 
                 launch_args = {
