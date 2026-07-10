@@ -88,6 +88,7 @@ class BrowserManager:
                         "--no-sandbox",
                         "--disable-web-security",
                         "--disable-features=IsolateOrigins,site-per-process",
+                        "--disable-blink-features=AutomationControlled",
                     ],
                 }
                 
@@ -100,6 +101,14 @@ class BrowserManager:
                 # Launch Chromium as a persistent browser context to share Google Account logins & cookies
                 logger.info("launching_persistent_browser_context", user_data_dir=user_data_dir)
                 context = await self._playwright.chromium.launch_persistent_context(**launch_args)
+                
+                # Add default human-like request headers and anti-detection settings
+                await context.set_extra_http_headers({
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"',
+                })
                 
                 # Block heavy resources on the persistent context
                 async def block_resources(route: Route) -> None:
@@ -216,6 +225,20 @@ class BrowserManager:
 
         return self._contexts[context_id]
 
+    async def _create_new_page_safely(self, context_id: str = "default") -> Page:
+        """Create a new page, restarting the browser if the context has been closed."""
+        try:
+            context = await self.get_context(context_id)
+            return await context.new_page()
+        except Exception as e:
+            if any(x in str(e).lower() for x in ("closed", "connection", "not started", "destroyed")):
+                logger.info("browser_context_closed_restarting", error=str(e))
+                await self.restart()
+                context = await self.get_context(context_id)
+                return await context.new_page()
+            else:
+                raise
+
     async def _get_page(self, context_id: str = "default") -> Page:
         """Get a page from pool or create new."""
         async with self._lock:
@@ -225,9 +248,8 @@ class BrowserManager:
                     entry.in_use = True
                     return entry.page
 
-        # Create new page
-        context = await self.get_context(context_id)
-        page = await context.new_page()
+        # Create new page safely
+        page = await self._create_new_page_safely(context_id)
 
         async with self._lock:
             self._pages_created += 1
@@ -692,13 +714,7 @@ class BrowserManager:
         which is not available when using the persistent context approach.
         """
         async with self._semaphore:
-            # Always use the persistent default context for website scraping
-            if "default" not in self._contexts:
-                raise RuntimeError("Browser not started — call browser.start() first")
-
-            context = self._contexts["default"]
-            page = await context.new_page()
-
+            page = await self._create_new_page_safely("default")
             try:
                 yield page
             finally:
