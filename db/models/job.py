@@ -42,6 +42,11 @@ class Job(Base):
         nullable=False,
         index=True,
     )
+    organization_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+    )
     
     # Search parameters
     niche: Mapped[str | None] = mapped_column(String(255), nullable=True)

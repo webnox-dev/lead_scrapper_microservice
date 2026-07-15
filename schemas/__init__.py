@@ -16,6 +16,7 @@ class JobCreate(BaseModel):
     areas: list[str] = Field(default_factory=list)
     max_results: int = Field(default=50, ge=1, le=10000)
     concurrency: int = Field(default=3, ge=1, le=10)
+    organization_id: str | None = Field(default=None, max_length=255)
 
     @model_validator(mode="before")
     @classmethod
@@ -95,6 +96,7 @@ class JobResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     error_message: str | None
+    organization_id: str | None = None
 
     class Config:
         from_attributes = True

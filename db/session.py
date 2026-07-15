@@ -45,3 +45,5 @@ async def init_db():
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        from sqlalchemy import text
+        await conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS organization_id VARCHAR(255);"))

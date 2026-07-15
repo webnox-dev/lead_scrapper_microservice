@@ -37,6 +37,7 @@ async def create_job(
         max_results=job_data.max_results,
         concurrency=job_data.concurrency,
         total_keywords=len(job_data.keywords) * len(job_data.areas),
+        organization_id=job_data.organization_id,
     )
     db.add(job)
     await db.commit()
@@ -76,13 +77,20 @@ async def create_job(
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         "error_message": job.error_message,
+        "organization_id": job.organization_id,
     }
 
 
 @router.get("/niches", response_model=list)
-async def list_niches(db: DbSession) -> list:
+async def list_niches(
+    db: DbSession,
+    organization_id: str | None = Query(None),
+) -> list:
     """List all unique niches (keywords) with stats."""
-    result = await db.execute(select(Job))
+    query = select(Job)
+    if organization_id:
+        query = query.where(Job.organization_id == organization_id)
+    result = await db.execute(query)
     jobs = result.scalars().all()
     
     niche_stats = {}
@@ -111,17 +119,25 @@ async def list_niches(db: DbSession) -> list:
 
 
 @router.delete("/niches/{niche_name}", response_model=dict)
-async def delete_niche(niche_name: str, db: DbSession) -> dict:
+async def delete_niche(
+    niche_name: str,
+    db: DbSession,
+    organization_id: str | None = Query(None),
+) -> dict:
     """Delete all jobs and their leads for a given niche topic."""
     from sqlalchemy import Text
     from db.models.lead import Lead
 
     # Find all jobs belonging to this niche
+    job_filter = (
+        (func.lower(Job.niche) == niche_name.lower()) |
+        ((Job.niche == None) & func.lower(Job.keywords.cast(Text)).like(f'%"{niche_name.lower()}"%'))
+    )
+    if organization_id:
+        job_filter = job_filter & (Job.organization_id == organization_id)
+
     result = await db.execute(
-        select(Job).where(
-            (func.lower(Job.niche) == niche_name.lower()) |
-            ((Job.niche == None) & func.lower(Job.keywords.cast(Text)).like(f'%"{niche_name.lower()}"%'))
-        )
+        select(Job).where(job_filter)
     )
     jobs = result.scalars().all()
     job_ids = [job.id for job in jobs]
@@ -159,22 +175,36 @@ async def delete_niche(niche_name: str, db: DbSession) -> dict:
 
 
 @router.put("/niches/{niche_name}", response_model=dict)
-async def rename_niche(niche_name: str, new_name: str = Query(..., min_length=1), db: DbSession = None) -> dict:
+async def rename_niche(
+    niche_name: str,
+    new_name: str = Query(..., min_length=1),
+    organization_id: str | None = Query(None),
+    db: DbSession = None,
+) -> dict:
     """Rename a niche topic in all jobs and leads."""
     from db.models.lead import Lead
 
     # 1. Update jobs
+    job_filter = func.lower(Job.niche) == niche_name.lower()
+    if organization_id:
+        job_filter = job_filter & (Job.organization_id == organization_id)
+
     result = await db.execute(
-        select(Job).where(func.lower(Job.niche) == niche_name.lower())
+        select(Job).where(job_filter)
     )
     jobs = result.scalars().all()
     for job in jobs:
         job.niche = new_name
 
     # 2. Update leads
-    lead_result = await db.execute(
-        select(Lead).where(func.lower(Lead.niche) == niche_name.lower())
-    )
+    if organization_id:
+        lead_result = await db.execute(
+            select(Lead).join(Job).where((func.lower(Lead.niche) == niche_name.lower()) & (Job.organization_id == organization_id))
+        )
+    else:
+        lead_result = await db.execute(
+            select(Lead).where(func.lower(Lead.niche) == niche_name.lower())
+        )
     leads = lead_result.scalars().all()
     for lead in leads:
         lead.niche = new_name
@@ -189,6 +219,7 @@ async def list_jobs(
     db: DbSession,
     status_filter: str | None = Query(None, alias="status"),
     niche: str | None = Query(None),
+    organization_id: str | None = Query(None),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -202,14 +233,16 @@ async def list_jobs(
 
     if niche:
         from sqlalchemy import Text
-        query = query.where(
+        niche_filter = (
             (func.lower(Job.niche) == niche.lower()) |
             ((Job.niche == None) & func.lower(Job.keywords.cast(Text)).like(f'%"{niche.lower()}"%'))
         )
-        count_query = count_query.where(
-            (func.lower(Job.niche) == niche.lower()) |
-            ((Job.niche == None) & func.lower(Job.keywords.cast(Text)).like(f'%"{niche.lower()}"%'))
-        )
+        query = query.where(niche_filter)
+        count_query = count_query.where(niche_filter)
+
+    if organization_id:
+        query = query.where(Job.organization_id == organization_id)
+        count_query = count_query.where(Job.organization_id == organization_id)
 
     query = query.order_by(desc(Job.created_at)).offset(offset).limit(limit)
 
@@ -247,6 +280,7 @@ async def list_jobs(
             "started_at": job.started_at.isoformat() if job.started_at else None,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             "error_message": job.error_message,
+            "organization_id": job.organization_id,
         })
 
     return {
@@ -289,6 +323,7 @@ async def get_system_stats() -> dict:
 async def get_job(
     job_id: UUID,
     db: DbSession,
+    organization_id: str | None = Query(None),
 ) -> dict:
     """Get job by ID."""
     job = await db.get(Job, job_id)
@@ -296,6 +331,11 @@ async def get_job(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found",
+        )
+    if organization_id and job.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Job belongs to another workspace",
         )
 
     pm = get_pipeline_manager()
@@ -324,6 +364,7 @@ async def get_job(
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         "error_message": job.error_message,
+        "organization_id": job.organization_id,
     }
 
 
@@ -331,6 +372,7 @@ async def get_job(
 async def delete_job(
     job_id: UUID,
     db: DbSession,
+    organization_id: str | None = Query(None),
 ) -> None:
     """Delete a job and all its results (cascade)."""
     job = await db.get(Job, job_id)
@@ -338,6 +380,11 @@ async def delete_job(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found",
+        )
+    if organization_id and job.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Job belongs to another workspace",
         )
 
     # Cancel if running
@@ -353,6 +400,7 @@ async def delete_job(
 async def pause_job(
     job_id: UUID,
     db: DbSession,
+    organization_id: str | None = Query(None),
 ) -> dict:
     """Pause (cancel background task) a running job."""
     job = await db.get(Job, job_id)
@@ -360,6 +408,11 @@ async def pause_job(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found",
+        )
+    if organization_id and job.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Job belongs to another workspace",
         )
 
     pm = get_pipeline_manager()
@@ -380,6 +433,7 @@ async def pause_job(
 async def resume_job(
     job_id: UUID,
     db: DbSession,
+    organization_id: str | None = Query(None),
 ) -> dict:
     """Resume a paused or failed job."""
     job = await db.get(Job, job_id)
@@ -387,6 +441,11 @@ async def resume_job(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found",
+        )
+    if organization_id and job.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Job belongs to another workspace",
         )
 
     pm = get_pipeline_manager()
@@ -421,6 +480,7 @@ async def resume_job(
 async def retry_job(
     job_id: UUID,
     db: DbSession,
+    organization_id: str | None = Query(None),
 ) -> dict:
     """Retry a failed job."""
     job = await db.get(Job, job_id)
@@ -428,6 +488,11 @@ async def retry_job(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found",
+        )
+    if organization_id and job.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Job belongs to another workspace",
         )
 
     pm = get_pipeline_manager()
@@ -465,10 +530,22 @@ from sqlalchemy.orm import selectinload
 async def get_job_enriched_results(
     job_id: UUID,
     db: DbSession,
+    organization_id: str | None = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> list:
     """Get enriched leads for a job."""
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+    if organization_id and job.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Job belongs to another workspace",
+        )
     query = select(Lead).where(Lead.job_id == job_id).options(selectinload(Lead.collection)).offset(offset).limit(limit)
     result = await db.execute(query)
     leads = result.scalars().all()
@@ -519,10 +596,22 @@ async def get_job_enriched_results(
 async def get_job_raw_results(
     job_id: UUID,
     db: DbSession,
+    organization_id: str | None = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> list:
     """Get raw collections for a job."""
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+    if organization_id and job.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Job belongs to another workspace",
+        )
     query = select(Collection).where(Collection.job_id == job_id).offset(offset).limit(limit)
     result = await db.execute(query)
     collections = result.scalars().all()
@@ -551,6 +640,7 @@ async def get_job_raw_results(
 async def get_job_queue_stats(
     job_id: UUID,
     db: DbSession,
+    organization_id: str | None = Query(None),
 ) -> dict:
     """Get real-time queue statistics for a job."""
     job = await db.get(Job, job_id)
@@ -558,6 +648,11 @@ async def get_job_queue_stats(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found",
+        )
+    if organization_id and job.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Job belongs to another workspace",
         )
 
     pm = get_pipeline_manager()

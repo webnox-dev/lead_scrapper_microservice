@@ -190,6 +190,7 @@ async def list_leads(
     db: DbSession,
     job_id: str | None = Query(None),
     niche: str | None = Query(None),
+    organization_id: str | None = Query(None),
     limit: int = Query(50, ge=1, le=10000),
     offset: int = Query(0, ge=0),
 ) -> dict:
@@ -215,6 +216,11 @@ async def list_leads(
             (func.lower(Lead.niche) == niche.lower()) |
             (func.lower(Collection.keyword) == niche.lower())
         )
+
+    if organization_id:
+        from db.models.job import Job
+        query = query.join(Job).where(Job.organization_id == organization_id)
+        count_query = count_query.join(Job).where(Job.organization_id == organization_id)
 
     # Order by company name
     query = query.order_by(Lead.company_name).offset(offset).limit(limit).options(selectinload(Lead.collection))
