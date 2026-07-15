@@ -52,7 +52,8 @@ class DiscoveryService:
         Returns:
             List of all business detail dicts found.
         """
-        search_term = f"{keyword} {area}"
+        # An empty area means a global keyword search.
+        search_term = f"{keyword} {area}".strip()
         logger.info("discovery_started", keyword=keyword, area=area)
 
         # Search Google Maps

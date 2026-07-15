@@ -19,12 +19,12 @@ from db.models.collection import Collection
 from db.models.lead import Lead
 from services.discovery import DiscoveryService
 from services.enrichment import EnrichmentService
-from services.enrichment.enrichment import clean_phone
+from services.enrichment.phone import clean_phone, verify_phone
 
 logger = get_logger(__name__)
 
 
-def detect_country_iso(address: str | None, area: str | None) -> str:
+def detect_country_iso(address: str | None, area: str | None) -> str | None:
     """Detect the 2-letter ISO country code from address or search area."""
     full_text = f"{address or ''} {area or ''}".lower()
     
@@ -53,7 +53,10 @@ def detect_country_iso(address: str | None, area: str | None) -> str:
     if any(s in full_text for s in indian_states) or "india" in full_text:
         return "IN"
         
-    return "IN"
+    # Unknown country must remain unknown. Explicit international numbers are
+    # parsed from their own country code; local numbers without a country
+    # context are rejected rather than being guessed as Indian.
+    return None
 
 # How many leads to buffer before flushing to DB
 COMMIT_BATCH_SIZE = 1
@@ -271,6 +274,10 @@ class PipelineManager:
         browser = get_browser_manager()
         await browser.start()
 
+        # Jobs created before global searches were supported may still have
+        # an empty areas array. Treat those jobs as one keyword-only search.
+        effective_areas = areas or [""]
+
         try:
             # Mark job as running
             async with AsyncSessionLocal() as db:
@@ -367,7 +374,7 @@ class PipelineManager:
             # Run discovery for all keyword/area combinations
             all_found = len(existing_cols)
             for keyword in keywords:
-                for area in areas:
+                for area in effective_areas:
                     if all_found >= max_results:
                         break
 
@@ -451,7 +458,8 @@ class PipelineManager:
                 country_iso = detect_country_iso(biz.get("address"), area)
 
                 phone = biz.get("phone", "").strip() if biz.get("phone") else ""
-                phone_cleaned = clean_phone(phone, country_iso) if phone else ""
+                phone_verification = verify_phone(phone, country_iso, source="listing") if phone else {}
+                phone_cleaned = phone_verification.get("cleaned", "") if phone_verification.get("valid") else ""
                 # Keep the cleaned phone on the biz dictionary
                 if phone_cleaned:
                     biz["phone"] = phone_cleaned

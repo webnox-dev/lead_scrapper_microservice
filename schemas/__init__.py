@@ -26,18 +26,24 @@ class JobCreate(BaseModel):
             if "keyword" in data and ("keywords" not in data or not data["keywords"]):
                 data["keywords"] = [data["keyword"]]
 
-            # Map single 'location' to 'areas' list
+            # Map single 'location' to 'areas' list. An empty location is a
+            # valid global search and must not be replaced with a country.
             if "location" in data and ("areas" not in data or not data["areas"]):
-                if data["location"]:
-                    data["areas"] = [data["location"]]
-                else:
-                    data["areas"] = ["India"] # default location if not specified
+                location = str(data["location"] or "").strip()
+                data["areas"] = [location]
+            elif "areas" not in data or not data["areas"]:
+                # Keep the pipeline iterable when callers omit location.
+                data["areas"] = [""]
 
             # Generate default name if not provided
             if "name" not in data or not data["name"]:
                 keyword = data.get("keyword") or (data.get("keywords")[0] if data.get("keywords") else "Scraping Job")
-                location = data.get("location") or (data.get("areas")[0] if data.get("areas") else "All Locations")
-                data["name"] = f"{keyword} {location}"
+                area_values = data.get("areas") or []
+                location = data.get("location") or next(
+                    (str(area).strip() for area in area_values if str(area).strip()),
+                    "All Locations",
+                )
+                data["name"] = f"{keyword} {location}".strip()
 
             # Ensure concurrency is present
             if "concurrency" not in data:
@@ -64,7 +70,7 @@ class JobCreate(BaseModel):
     @classmethod
     def validate_areas(cls, v: list[str]) -> list[str]:
         if not v:
-            raise ValueError("At least one area is required")
+            return [""]
         new_areas = []
         for item in v:
             if "," in item:
@@ -73,7 +79,7 @@ class JobCreate(BaseModel):
                 new_areas.append(item.strip())
         final_areas = [a for a in new_areas if a]
         if not final_areas:
-            raise ValueError("At least one area is required")
+            return [""]
         return final_areas
 
 

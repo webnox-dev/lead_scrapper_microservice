@@ -21,15 +21,25 @@ logger = get_logger(__name__)
 
 
 # Contact extraction patterns
+CONTACT_FILTER_VERSION = 2
+
 EMAIL_PATTERN = re.compile(
     r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b",
     re.IGNORECASE
 )
 
-PHONE_PATTERN = re.compile(
-    r"(?:\+91[-\s]?)?(?:\d{2,5}[-\s]?\d{5,8})|(?:\+91[-\s]?)?\d{10}",
-    re.IGNORECASE
+TECHNICAL_EMAIL_DOMAIN_SUFFIXES = (
+    ".wixpress.com",
+    ".sentry.io",
 )
+
+NON_ACTIONABLE_EMAIL_LOCAL_PARTS = {
+    "mailer-daemon",
+    "no-reply",
+    "noreply",
+    "do-not-reply",
+    "donotreply",
+}
 
 SOCIAL_PATTERNS = {
     "linkedin": re.compile(r"linkedin\.com/(?:company|in)/[^\s\"<>]+", re.I),
@@ -48,66 +58,32 @@ HIGH_VALUE_PAGES = [
 
 import phonenumbers
 
-def clean_phone(phone: str, default_region: str = "IN") -> str:
-    """Clean and standardize phone number using Google's phonenumbers library.
-    
-    Returns:
-    - 10-digit number for Indian numbers (no +91 prefix) as expected by the DB/UI.
-    - E.164 format (e.g. +971543470278) for international numbers.
-    """
-    if not phone:
-        return ""
-    try:
-        # Normalize/clean spaces and brackets first so phonenumbers can parse it cleanly
-        cleaned_input = phone.strip()
-        # Parse using the detected default region
-        parsed = phonenumbers.parse(cleaned_input, default_region)
-        if phonenumbers.is_possible_number(parsed):
-            if parsed.country_code == 91:
-                # Standard Indian 10-digit national number
-                return str(parsed.national_number)
-            else:
-                # E.164 format for international
-                return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
-    except Exception:
-        pass
-    
-    # Fallback to simple cleaning if phonenumbers fails
-    digits = re.sub(r"\D", "", phone)
-    if phone.strip().startswith("+"):
-        return f"+{digits}"
-    return digits
 
-
-def is_valid_phone_number(raw_phone: str, cleaned_phone: str, default_region: str = "IN") -> bool:
-    """Validate extracted phone number to filter out false positives."""
-    if not cleaned_phone:
+def is_business_email(email: str) -> bool:
+    """Reject technical and non-actionable email addresses."""
+    normalized = email.strip().lower().rstrip(".,;:")
+    local_part, separator, domain = normalized.rpartition("@")
+    if not separator or not local_part or not domain:
         return False
-        
-    try:
-        # Parse and check validity
-        parsed = phonenumbers.parse(cleaned_phone, default_region)
-        if phonenumbers.is_valid_number(parsed):
-            check_digits = str(parsed.national_number)
-            # Filter out dummy repeating digits (e.g. 9999999999 or any digit repeating 6+ times)
-            if re.search(r"(\d)\1{5,}", check_digits):
-                return False
-            # Filter out common sequential test sequences
-            if check_digits in ("1234567890", "0123456789", "9876543210"):
-                return False
-            return True
-    except Exception:
-        pass
-        
-    # Fallback validation for edge cases
-    check_digits = cleaned_phone.lstrip("+")
-    if not (7 <= len(check_digits) <= 15):
+    if local_part in NON_ACTIONABLE_EMAIL_LOCAL_PARTS:
         return False
-    if re.search(r"(\d)\1{5,}", check_digits):
-        return False
-    if check_digits in ("1234567890", "0123456789", "9876543210"):
+    if domain in {"wixpress.com", "sentry.io"} or domain.endswith(TECHNICAL_EMAIL_DOMAIN_SUFFIXES):
         return False
     return True
+
+
+def filter_business_emails(emails: list[str] | set[str] | None) -> list[str]:
+    """Deduplicate emails while preserving their original order."""
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for email in emails or []:
+        value = email.strip().rstrip(".,;:")
+        key = value.lower()
+        if key in seen or not is_business_email(value):
+            continue
+        seen.add(key)
+        filtered.append(value)
+    return filtered
 
 
 
@@ -121,6 +97,9 @@ class EnrichmentService:
     async def _verify_email_address(self, email: str) -> bool:
         """Verify email syntax and deliverability (MX records) asynchronously."""
         email = email.strip()
+
+        if not is_business_email(email):
+            return False
         
         # Blacklist of placeholder emails
         placeholder_blacklist = {
@@ -148,7 +127,7 @@ class EnrichmentService:
         self,
         website: str,
         name_hint: str = "",
-        default_region: str = "IN",
+        default_region: str | None = None,
         search_keyword: str = "",
     ) -> dict[str, Any] | None:
         """Enrich a single website — extract contacts.
@@ -183,58 +162,45 @@ class EnrichmentService:
                 
                 query_res = await self.db.execute(stmt)
                 existing_lead = query_res.scalar_one_or_none()
+                cached_data = (existing_lead.enrichment_data or {}) if existing_lead else {}
                 
-                if existing_lead and (
-                    existing_lead.emails or 
-                    existing_lead.phones or 
-                    existing_lead.whatsapp_numbers or 
-                    existing_lead.social_links
-                ):
-                    # Check if the cached enrichment data contains verification metadata
-                    cached_data = existing_lead.enrichment_data or {}
-                    has_verification = "verification" in cached_data
-                    has_advanced_linkedin = False
-                    if has_verification:
-                        linkedin_data = cached_data["verification"].get("linkedin", {})
-                        # If profile is verified, check if we have scraped advanced fields (like followers or headquarters)
-                        if linkedin_data.get("verified"):
-                            has_advanced_linkedin = "followers" in linkedin_data or "headquarters" in linkedin_data
-                        else:
-                            has_advanced_linkedin = True  # Not verified, so no advanced info needed
-                    
-                        # Filter out any newly classified invalid phones from the cached results
-                        cleaned_cached_phones = []
-                        for phone in (existing_lead.phones or []):
-                            v_res = verify_phone(phone, default_region)
-                            if v_res["valid"]:
-                                cleaned_cached_phones.append(v_res["cleaned"])
-                        
-                        # Also filter the verification details list
-                        v_details = cached_data["verification"].get("phones", [])
-                        filtered_v_details = []
-                        for item in v_details:
-                            v_res = verify_phone(item.get("cleaned", ""), default_region)
-                            if v_res["valid"]:
-                                filtered_v_details.append(v_res)
-                        cached_data["verification"]["phones"] = filtered_v_details
+                cache_is_current = (
+                    existing_lead is not None
+                    and cached_data.get("contact_filter_version") == CONTACT_FILTER_VERSION
+                    and bool(
+                        existing_lead.emails
+                        or existing_lead.phones
+                        or existing_lead.whatsapp_numbers
+                        or existing_lead.social_links
+                    )
+                )
 
+                if cache_is_current:
+                    has_verification = "verification" in cached_data
+                    if has_verification:
                         logger.info("enrichment_cache_hit", website=website, lead_id=str(existing_lead.id))
                         print(f"Cache Hit: {website} (Reusing contacts)")
+                        cached_phones = list(existing_lead.phones or [])
+                        cached_whatsapp = list(existing_lead.whatsapp_numbers or [])
                         return {
                             "company": existing_lead.company_name or name_hint,
                             "website": existing_lead.website or website,
-                            "emails": existing_lead.emails,
-                            "phones": cleaned_cached_phones,
-                            "whatsapp_numbers": existing_lead.whatsapp_numbers,
+                            "emails": filter_business_emails(existing_lead.emails),
+                            "phones": cached_phones,
+                            "whatsapp_numbers": cached_whatsapp,
                             "addresses": [existing_lead.address] if existing_lead.address else [],
                             "social_links": existing_lead.social_links,
                             "contact_pages": cached_data.get("contact_pages", []),
                             "pages_crawled": existing_lead.pages_crawled,
                             "verification": cached_data["verification"],
+                            "contact_filter_version": CONTACT_FILTER_VERSION,
                         }
                     else:
-                        logger.info("enrichment_cache_ignored_no_verification_or_advanced_details", website=website)
-                        print(f"Cache Ignored (No advanced verification data): {website}")
+                        logger.info("enrichment_cache_ignored_no_verification", website=website)
+                        print(f"Cache Ignored (No verification data): {website}")
+                elif existing_lead:
+                    logger.info("enrichment_cache_ignored_stale_contact_filter", website=website)
+                    print(f"Cache Ignored (Refreshing contact quality): {website}")
             except Exception as e:
                 logger.warning("enrichment_cache_lookup_failed", website=website, error=str(e))
 
@@ -242,7 +208,7 @@ class EnrichmentService:
         result = await self._scrape_website(website, name_hint, default_region, search_keyword)
 
         if result:
-            raw_emails = result.get("emails", [])
+            raw_emails = filter_business_emails(result.get("emails", []))
             verified_emails = []
             for email in raw_emails:
                 if await self._verify_email_address(email):
@@ -258,21 +224,21 @@ class EnrichmentService:
             verified_phones_details = []
             valid_phones = []
             for phone in phones:
-                v_res = verify_phone(phone, default_region)
-                verified_phones_details.append(v_res)
+                v_res = verify_phone(phone, default_region, source="extracted")
                 if v_res["valid"]:
+                    verified_phones_details.append(v_res)
                     valid_phones.append(v_res["cleaned"])
             
             # Always verify and include the main listing phone if available
             if result.get("phone"):
-                v_res = verify_phone(result["phone"], default_region)
-                # Avoid duplicates in verified details
-                if not any(d.get("cleaned") == v_res["cleaned"] for d in verified_phones_details):
+                v_res = verify_phone(result["phone"], default_region, source="listing")
+                if v_res["valid"] and not any(d.get("cleaned") == v_res["cleaned"] for d in verified_phones_details):
                     verified_phones_details.append(v_res)
                 if v_res["valid"] and v_res["cleaned"] not in valid_phones:
                     valid_phones.append(v_res["cleaned"])
 
-            result["phones"] = list(set(valid_phones))
+            result["emails"] = filter_business_emails(verified_emails)
+            result["phones"] = list(dict.fromkeys(valid_phones))
 
             # 2. LinkedIn Profile Verification (via DuckDuckGo)
             linkedin_details = {
@@ -310,6 +276,7 @@ class EnrichmentService:
                 "phones": verified_phones_details,
                 "linkedin": linkedin_details,
             }
+            result["contact_filter_version"] = CONTACT_FILTER_VERSION
         else:
             print(f"Failed: {name_hint or website}: no contacts found")
 
@@ -319,7 +286,7 @@ class EnrichmentService:
         self,
         website: str,
         name_hint: str,
-        default_region: str = "IN",
+        default_region: str | None = None,
         search_keyword: str = "",
     ) -> dict[str, Any] | None:
         """Attempt to scrape the website using fast HTTP requests first."""
@@ -458,7 +425,7 @@ class EnrichmentService:
         self,
         website: str,
         name_hint: str,
-        default_region: str = "IN",
+        default_region: str | None = None,
         search_keyword: str = "",
     ) -> dict[str, Any] | None:
         """Scrape website for contact information."""
@@ -480,7 +447,10 @@ class EnrichmentService:
                     result = await self._scrape_website_httpx(url, name_hint, default_region, search_keyword)
                     if result:
                         has_emails = len(result.get("emails", [])) > 0
-                        has_valid_phones = any(verify_phone(p, default_region)["valid"] for p in result.get("phones", []))
+                        has_valid_phones = any(
+                            verify_phone(p, default_region, source="extracted")["valid"]
+                            for p in result.get("phones", [])
+                        )
                         if has_emails or has_valid_phones:
                             logger.info("enrichment_httpx_success", website=url)
                             return result
@@ -643,7 +613,7 @@ class EnrichmentService:
             return match.group(1)
         return None
 
-    def _extract_contacts(self, text: str, html: str, default_region: str = "IN") -> dict[str, Any]:
+    def _extract_contacts(self, text: str, html: str, default_region: str | None = None) -> dict[str, Any]:
         """Extract contact information from text and HTML using phonenumbers."""
         results = {
             "emails": set(),
@@ -653,7 +623,8 @@ class EnrichmentService:
             "addresses": [],
         }
 
-        # Extract emails
+        # Extract emails and remove technical/non-actionable addresses before
+        # deliverability checks (telemetry domains often have valid MX).
         raw_emails = set(EMAIL_PATTERN.findall(text))
 
         # Extract mailto links
@@ -666,57 +637,58 @@ class EnrichmentService:
             ".mp4", ".mov", ".avi", ".mp3", ".wav"
         )
         for email in raw_emails:
-            email_lower = email.lower().strip()
-            if not email_lower.endswith(ignored_email_extensions):
-                results["emails"].add(email)
+            email_value = email.strip().rstrip(".,;:")
+            email_lower = email_value.lower()
+            if (
+                not email_lower.endswith(ignored_email_extensions)
+                and is_business_email(email_value)
+            ):
+                results["emails"].add(email_value)
 
-        # Extract tel links (href="tel:..." or general tel: prefix)
+        # Prefer explicit contact links. These are much stronger signals than
+        # arbitrary digit sequences in page text.
+        phone_candidates: list[tuple[str, str, str]] = []
         tel_matches = re.findall(r'href=["\']tel:([^"\']+)["\']', html, re.I)
-        # Fallback to general tel: matching
         tel_matches.extend(re.findall(r'tel:([\d+\-\s()]+)', html, re.I))
+        phone_candidates.extend((value, "tel", "") for value in tel_matches if value)
 
         # Extract phone numbers from WhatsApp link hrefs (phone parameters)
         wa_phone_matches = re.findall(r'wa\.me/(\d+)|whatsapp\.com/send\?phone=(\d+)', html, re.I)
         for match in wa_phone_matches:
             num = match[0] if match[0] else match[1]
             if num:
-                tel_matches.append(num)
+                # WhatsApp URLs commonly contain an international number
+                # without a leading '+'. Treat it as international rather
+                # than interpreting it in the page's local region.
+                phone_candidates.append((f"+{num}", "whatsapp", ""))
 
-        # Extract phone numbers from anchor tag text contents (e.g., <a ...>+91 8940833985</a>)
-        anchor_texts = re.findall(r'<a\b[^>]*>([\s\S]*?)</a>', html, re.I)
-        for text_content in anchor_texts:
-            # Clean HTML tags inside the anchor text if any (e.g. span, strong)
-            clean_text = re.sub(r'<[^>]*>', '', text_content).strip()
-            # If the clean text contains 6 to 15 digits, we add it to candidates
-            digits_only = re.sub(r'\D', '', clean_text)
-            if 6 <= len(digits_only) <= 15:
-                tel_matches.append(clean_text)
-        
-        # Extract phone numbers from body text using PHONE_PATTERN
-        text_matches = PHONE_PATTERN.findall(text)
-        for match in text_matches:
-            if match:
-                tel_matches.append(match)
-
-        # Extract phone numbers from body text using Google's phonenumbers library Matcher
+        # Extract body-text candidates only through libphonenumber. Each
+        # candidate must also have explicit country notation or nearby contact
+        # context; this prevents IDs, counters, dates, and script values from
+        # becoming phone numbers.
         try:
             for match in phonenumbers.PhoneNumberMatcher(text, default_region):
-                formatted = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.E164)
-                tel_matches.append(formatted)
+                # Keep the context deliberately tight. A broad window can
+                # let a label for one phone authorize an unrelated ID that
+                # appears earlier in the same paragraph.
+                context_start = max(0, match.start - 32)
+                context_end = min(len(text), match.end + 16)
+                context = text[context_start:context_end]
+                phone_candidates.append((match.raw_string, "body", context))
         except Exception:
             pass
-        
-        for tel in set(tel_matches):
-            cleaned = clean_phone(tel, default_region)
-            if is_valid_phone_number(tel, cleaned, default_region):
-                results["phones"].add(cleaned)
 
-        # Extract WhatsApp
-        for match in wa_phone_matches:
-            num = match[0] if match[0] else match[1]
-            if num:
-                cleaned = clean_phone(num, default_region)
-                results["whatsapp"].add(cleaned)
+        for raw_phone, source, context in phone_candidates:
+            verification = verify_phone(
+                raw_phone,
+                default_region,
+                source=source,
+                context=context,
+            )
+            if verification["valid"] and verification["cleaned"]:
+                results["phones"].add(verification["cleaned"])
+                if source == "whatsapp":
+                    results["whatsapp"].add(verification["cleaned"])
 
         # Extract social links
         for platform, pattern in SOCIAL_PATTERNS.items():
